@@ -32,7 +32,8 @@ class Posnet {
     return this.pedir("POST", "/api/dispositivo/clave-publica", { clavePublica: this.clavePublica });
   }
 
-  op(tipo: string, datos: Record<string, unknown>, minuto = 0) {
+  // Operación tal como la arma el posnet. Se tipa suelta para poder armar también operaciones mal hechas.
+  op(tipo: string, datos: Record<string, unknown>, minuto = 0): Record<string, any> {
     return { id: randomUUID(), seq: ++this.seq, creada: a(minuto), tipo, ...datos };
   }
 
@@ -248,7 +249,7 @@ describe("ventas, turnos y arqueo", () => {
     const e = await armarEvento();
     const { turnoId, op } = abrirTurno(e.posnet, e.cajero.id);
     const mal = e.posnet.venta(turnoId, e.cajero.id, [{ producto: e.cerveza, cantidad: 1 }]);
-    (mal as { pagos: { medio: string; monto: number }[] }).pagos = [{ medio: "efectivo", monto: 1 }];
+    mal.pagos = [{ medio: "efectivo", monto: 1 }];
     const buena = e.posnet.venta(turnoId, e.cajero.id, [{ producto: e.cerveza, cantidad: 1 }]);
     const { resultados, ultimaSeqContigua } = await e.posnet.subir(op, mal, "cualquier cosa", buena);
     expect(resultados.map((r) => r.estado)).toEqual(["ok", "invalida", "invalida", "ok"]);

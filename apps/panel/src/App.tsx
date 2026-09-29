@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { MODOS_VENTA, PLATAFORMAS, ROLES, type Cuenta, type Evento, type Usuario } from "@eventos/shared";
-import { alVencerSesion, api, guardarToken, hayToken, pesos } from "./api";
+import {
+  MODOS_VENTA,
+  PLATAFORMAS,
+  ROLES,
+  ROLES_CONFIGURACION,
+  VALIDEZ_VALES,
+  type Cuenta,
+  type Evento,
+  type Usuario,
+} from "@eventos/shared";
+import { alVencerSesion, api, fecha, guardarToken, hayToken, pesos } from "./api";
 import { Acceso } from "./Acceso";
+import { Reportes } from "./Reportes";
 
 type Opcion = { valor: string; texto: string };
 type Campo = {
@@ -12,11 +22,17 @@ type Campo = {
   opcional?: boolean;
   textoVacio?: string;
   mostrar?: (fila: Record<string, any>) => string;
+  /** Solo se muestra en la tabla: no se carga en el formulario. */
+  soloLectura?: boolean;
 };
 
-/** Convierte lo que se tipea en el formulario al formato que espera la API. Vacío = que use su valor por defecto. */
-function convertir(campo: Campo, valor: string): unknown {
-  if (valor === "") return undefined;
+/**
+ * Convierte lo que se tipea en el formulario al formato que espera la API.
+ * Vacío = que use su valor por defecto (al crear) o que no cambie (al editar),
+ * salvo en un desplegable opcional al editar, donde vacío es "ninguno".
+ */
+function convertir(campo: Campo, valor: string, editando: boolean): unknown {
+  if (valor === "") return editando && campo.tipo === "select" && campo.opcional ? null : undefined;
   switch (campo.tipo) {
     case "numero":
       return Number(valor);
@@ -32,7 +48,22 @@ function convertir(campo: Campo, valor: string): unknown {
   }
 }
 
-/** Tabla con alta y baja, reutilizada para cada recurso del evento. */
+/** Valor con el que arranca un campo al editar una fila. */
+function valorInicial(campo: Campo, fila: Record<string, any> | null): string {
+  const v = fila?.[campo.nombre];
+  if (v === null || v === undefined || campo.tipo === "clave") return "";
+  if (campo.tipo === "pesos") return String(v / 100);
+  if (campo.tipo === "fecha") return fechaLocal(v);
+  return String(v);
+}
+
+/** ISO → valor de un input datetime-local (hora del navegador). */
+export const fechaLocal = (iso: string) => {
+  const d = new Date(iso);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+};
+
+/** Tabla con alta, edición y baja, reutilizada para cada recurso del evento. */
 function Recurso({
   titulo,
   ruta,
@@ -40,6 +71,7 @@ function Recurso({
   alCambiar,
   soloAlta = false,
   acciones,
+  ayuda,
 }: {
   titulo: string;
   ruta: string;
@@ -48,9 +80,12 @@ function Recurso({
   soloAlta?: boolean;
   /** Botones extra por fila (por ejemplo, vincular un posnet). */
   acciones?: (fila: Record<string, any>, recargar: () => Promise<void>) => ReactNode;
+  ayuda?: ReactNode;
 }) {
   const [filas, setFilas] = useState<Record<string, any>[]>([]);
   const [error, setError] = useState("");
+  const [editando, setEditando] = useState<Record<string, any> | null>(null);
+  const editables = campos.filter((c) => !c.soloLectura);
 
   const cargar = useCallback(() => api<Record<string, any>[]>("GET", ruta).then(setFilas), [ruta]);
   useEffect(() => {
@@ -62,13 +97,15 @@ function Recurso({
     const form = e.currentTarget;
     const datos = new FormData(form);
     const cuerpo: Record<string, unknown> = {};
-    for (const c of campos) {
-      const v = convertir(c, String(datos.get(c.nombre) ?? ""));
+    for (const c of editables) {
+      const v = convertir(c, String(datos.get(c.nombre) ?? ""), editando !== null);
       if (v !== undefined) cuerpo[c.nombre] = v;
     }
     try {
-      await api("POST", ruta, cuerpo);
+      if (editando) await api("PATCH", `${ruta}/${editando.id}`, cuerpo);
+      else await api("POST", ruta, cuerpo);
       form.reset();
+      setEditando(null);
       setError("");
       await cargar();
       alCambiar?.();
@@ -110,6 +147,9 @@ function Recurso({
                 <td>
                   <div className="acciones">
                     {acciones?.(f, cargar)}
+                    <button className="secundario" onClick={() => setEditando(f)}>
+                      Editar
+                    </button>
                     <button className="secundario" onClick={() => borrar(f.id)}>
                       Borrar
                     </button>
@@ -120,12 +160,15 @@ function Recurso({
           </tbody>
         </table>
       )}
-      <form onSubmit={crear}>
-        {campos.map((c) => (
+      {ayuda && <p className="ayuda">{ayuda}</p>}
+      {/* La key reinicia el formulario al cambiar de fila, así toma los valores de la que se edita. */}
+      <form onSubmit={crear} key={editando?.id ?? "nuevo"} className={editando ? "editando" : undefined}>
+        {editando && <p className="ayuda">Editando «{editando.nombre}». Lo que dejes vacío no cambia.</p>}
+        {editables.map((c) => (
           <label key={c.nombre}>
             {c.titulo}
             {c.tipo === "select" ? (
-              <select name={c.nombre} defaultValue="">
+              <select name={c.nombre} defaultValue={valorInicial(c, editando)}>
                 {c.opcional && <option value="">{c.textoVacio ?? "(ninguno)"}</option>}
                 {c.opciones!.map((o) => (
                   <option key={o.valor} value={o.valor}>
@@ -139,24 +182,157 @@ function Recurso({
                 type={c.tipo === "fecha" ? "datetime-local" : c.tipo === "clave" ? "password" : "text"}
                 autoComplete={c.tipo === "clave" ? "new-password" : undefined}
                 inputMode={c.tipo === "numero" || c.tipo === "pesos" ? "decimal" : undefined}
-                required={!c.opcional}
+                required={!c.opcional && !editando}
+                defaultValue={valorInicial(c, editando)}
               />
             )}
           </label>
         ))}
-        <button>Agregar</button>
+        <button>{editando ? "Guardar" : "Agregar"}</button>
+        {editando && (
+          <button type="button" className="secundario" onClick={() => setEditando(null)}>
+            Cancelar
+          </button>
+        )}
       </form>
       {error && <p className="error">{error}</p>}
     </section>
   );
 }
 
-const fecha = (iso: string) =>
-  new Date(iso).toLocaleString("es-AR", { dateStyle: "short", timeStyle: "short", hour12: false });
-
 const opciones = (valores: readonly string[]): Opcion[] => valores.map((v) => ({ valor: v, texto: v }));
 
-function PantallaEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () => void }) {
+const PESTANAS = [
+  { id: "configuracion", texto: "Configuración" },
+  { id: "caja", texto: "Cajas y arqueos" },
+  { id: "ventas", texto: "Ventas" },
+  { id: "stock", texto: "Stock" },
+  { id: "vales", texto: "Vales" },
+  { id: "revisar", texto: "Para revisar" },
+] as const;
+type Pestana = (typeof PESTANAS)[number]["id"];
+
+function PantallaEvento({ evento, alCambiar, rol }: { evento: Evento; alCambiar: () => void; rol: Usuario["rol"] }) {
+  const [pestana, setPestana] = useState<Pestana>("configuracion");
+  // Los reportes son para supervisores y administradores.
+  const veReportes = (ROLES_CONFIGURACION as readonly string[]).includes(rol);
+  return (
+    <>
+      <section>
+        <h2>{evento.nombre}</h2>
+        <p>
+          {evento.lugar ?? "Sin lugar"} · {fecha(evento.inicio)} a {fecha(evento.fin)}
+        </p>
+        {veReportes && (
+          <nav className="pestanas">
+            {PESTANAS.map((p) => (
+              <button key={p.id} className={pestana === p.id ? "activo" : ""} onClick={() => setPestana(p.id)}>
+                {p.texto}
+              </button>
+            ))}
+          </nav>
+        )}
+      </section>
+      {pestana === "configuracion" || !veReportes ? (
+        <ConfiguracionEvento evento={evento} alCambiar={alCambiar} />
+      ) : (
+        <Reportes eventoId={evento.id} que={pestana} />
+      )}
+    </>
+  );
+}
+
+const VALIDEZ: Record<(typeof VALIDEZ_VALES)[number], string> = {
+  fin_evento: "Vencen al terminar el evento",
+  fecha: "Vencen en una fecha y hora",
+  sin_vencimiento: "No vencen (se canjean en otros eventos)",
+};
+
+/** Modo de venta, validez de los vales y plazo de anulación del evento. */
+function OpcionesEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () => void }) {
+  const [validez, setValidez] = useState(evento.valesValidez);
+  const [error, setError] = useState("");
+  const [guardado, setGuardado] = useState(false);
+
+  const guardar = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const datos = new FormData(e.currentTarget);
+    const vencimiento = String(datos.get("valesVencimiento") ?? "");
+    try {
+      await api("PATCH", `/eventos/${evento.id}`, {
+        modoVenta: datos.get("modoVenta"),
+        valesValidez: validez,
+        valesVencimiento: validez === "fecha" && vencimiento ? new Date(vencimiento).toISOString() : null,
+        minutosAnulacionCajero: Number(datos.get("minutosAnulacionCajero")),
+      });
+      setError("");
+      setGuardado(true);
+      alCambiar();
+    } catch (err) {
+      setError((err as Error).message);
+      setGuardado(false);
+    }
+  };
+
+  return (
+    <section>
+      <h2>Cómo se vende</h2>
+      <form onSubmit={guardar} onChange={() => setGuardado(false)}>
+        <label>
+          Modo de venta
+          <select name="modoVenta" defaultValue={evento.modoVenta}>
+            <option value="vales">Con vales de consumo</option>
+            <option value="directo">Directo (sin vales, comanda al sector)</option>
+          </select>
+        </label>
+        <label>
+          Vales
+          <select value={validez} onChange={(e) => setValidez(e.target.value as typeof validez)}>
+            {VALIDEZ_VALES.map((v) => (
+              <option key={v} value={v}>
+                {VALIDEZ[v]}
+              </option>
+            ))}
+          </select>
+        </label>
+        {validez === "fecha" && (
+          <label>
+            Vencen el
+            <input
+              name="valesVencimiento"
+              type="datetime-local"
+              required
+              defaultValue={evento.valesVencimiento ? fechaLocal(evento.valesVencimiento) : ""}
+            />
+          </label>
+        )}
+        <label>
+          Minutos para que el cajero anule solo
+          <input
+            name="minutosAnulacionCajero"
+            type="number"
+            min={0}
+            max={240}
+            required
+            defaultValue={evento.minutosAnulacionCajero}
+          />
+        </label>
+        <button>Guardar</button>
+        {guardado && <span className="ok">Guardado</span>}
+      </form>
+      {validez === "sin_vencimiento" && (
+        <p className="ayuda">
+          Un vale de este evento se puede canjear en otro evento tuyo que venda el mismo producto: se reconoce por el
+          código del producto o, si no tiene, por el nombre.
+        </p>
+      )}
+      <p className="ayuda">Pasado el plazo de anulación, hace falta la tarjeta de un supervisor.</p>
+      {error && <p className="error">{error}</p>}
+    </section>
+  );
+}
+
+function ConfiguracionEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () => void }) {
   const base = `/eventos/${evento.id}`;
   // Impresoras y sectores alimentan los desplegables de los otros recursos.
   const [impresoras, setImpresoras] = useState<Opcion[]>([]);
@@ -172,34 +348,14 @@ function PantallaEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () =
   useEffect(refrescar, [refrescar]);
 
   const nombreDe = (lista: Opcion[], id: unknown) => lista.find((o) => o.valor === String(id))?.texto ?? "—";
-
-  const [errorModo, setErrorModo] = useState("");
-  const cambiarModo = async (modoVenta: string) => {
-    try {
-      await api("PATCH", base, { modoVenta });
-      setErrorModo("");
-      alCambiar();
-    } catch (err) {
-      setErrorModo((err as Error).message);
-    }
-  };
+  const siNo: Opcion[] = [
+    { valor: "true", texto: "Sí" },
+    { valor: "false", texto: "No" },
+  ];
 
   return (
     <>
-      <section>
-        <h2>{evento.nombre}</h2>
-        <p>
-          {evento.lugar ?? "Sin lugar"} · {fecha(evento.inicio)} a {fecha(evento.fin)}
-        </p>
-        <label>
-          Modo de venta
-          <select value={evento.modoVenta} onChange={(e) => cambiarModo(e.target.value)}>
-            <option value="vales">Con vales de consumo</option>
-            <option value="directo">Directo (sin vales, comanda al sector)</option>
-          </select>
-        </label>
-        {errorModo && <p className="error">{errorModo}</p>}
-      </section>
+      <OpcionesEvento evento={evento} alCambiar={alCambiar} />
       <Recurso
         titulo="Impresoras de comandas"
         ruta={`${base}/impresoras`}
@@ -230,9 +386,11 @@ function PantallaEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () =
       <Recurso
         titulo="Productos"
         ruta={`${base}/productos`}
+        ayuda="Un producto que ya se vendió no se puede borrar: editalo y ponelo como no disponible."
         campos={[
           { nombre: "nombre", titulo: "Nombre" },
-          { nombre: "categoria", titulo: "Categoría", opcional: true },
+          { nombre: "codigo", titulo: "Código", opcional: true, mostrar: (f) => f.codigo ?? "—" },
+          { nombre: "categoria", titulo: "Categoría", opcional: true, mostrar: (f) => f.categoria ?? "—" },
           { nombre: "precio", titulo: "Precio ($)", tipo: "pesos", mostrar: (f) => pesos(f.precio) },
           {
             nombre: "sectorId",
@@ -242,17 +400,51 @@ function PantallaEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () =
             opcional: true,
             mostrar: (f) => nombreDe(sectores, f.sectorId),
           },
+          {
+            nombre: "controlaStock",
+            titulo: "Controla stock",
+            tipo: "select",
+            opciones: [...siNo].reverse(),
+            mostrar: (f) => (f.controlaStock ? "Sí" : "No"),
+          },
+          {
+            nombre: "activo",
+            titulo: "Disponible",
+            tipo: "select",
+            opciones: siNo,
+            mostrar: (f) => (f.activo ? "Sí" : "No"),
+          },
         ]}
       />
       <Recurso
         titulo="Puntos de venta"
         ruta={`${base}/puntos-venta`}
+        ayuda="Una caja cobra; un puesto de canje (una barra) lee los vales. Si le asignás un sector, solo canjea los vales de ese sector."
         acciones={(f, recargar) => (
           <VincularPosnet ruta={`${base}/puntos-venta/${f.id}`} fila={f} alCambiar={recargar} />
         )}
         campos={[
           { nombre: "nombre", titulo: "Nombre" },
           { nombre: "plataforma", titulo: "Posnet", tipo: "select", opciones: opciones(PLATAFORMAS) },
+          {
+            nombre: "tipo",
+            titulo: "Tipo",
+            tipo: "select",
+            opciones: [
+              { valor: "caja", texto: "Caja" },
+              { valor: "canje", texto: "Canje de vales" },
+            ],
+            mostrar: (f) => (f.tipo === "canje" ? "Canje de vales" : "Caja"),
+          },
+          {
+            nombre: "sectorId",
+            titulo: "Sector",
+            tipo: "select",
+            opciones: sectores,
+            opcional: true,
+            textoVacio: "Todos",
+            mostrar: (f) => (f.sectorId ? nombreDe(sectores, f.sectorId) : "Todos"),
+          },
           {
             nombre: "imprimeVales",
             titulo: "Vales",
@@ -264,6 +456,22 @@ function PantallaEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () =
               { valor: "false", texto: "Nunca" },
             ],
             mostrar: (f) => (f.imprimeVales === null ? "Según el evento" : f.imprimeVales ? "Siempre" : "Nunca"),
+          },
+          {
+            nombre: "vistaProductos",
+            titulo: "Productos en el posnet",
+            tipo: "select",
+            opciones: [
+              { valor: "lista", texto: "Lista" },
+              { valor: "fotos", texto: "Con fotos" },
+            ],
+            mostrar: (f) => (f.vistaProductos === "fotos" ? "Con fotos" : "Lista"),
+          },
+          {
+            nombre: "ultimaSincronizacion",
+            titulo: "Último contacto",
+            soloLectura: true,
+            mostrar: (f) => (f.ultimaSincronizacion ? fecha(f.ultimaSincronizacion) : f.dispositivoVinculado ? "Nunca" : "Sin posnet"),
           },
         ]}
       />
@@ -317,6 +525,7 @@ function PantallaUsuarios() {
     <Recurso
       titulo="Usuarios de la cuenta"
       ruta="/usuarios"
+      ayuda="Quien ya vendió o autorizó algo no se puede borrar: desactivalo."
       campos={[
         { nombre: "nombre", titulo: "Nombre" },
         { nombre: "usuario", titulo: "Usuario" },
@@ -329,6 +538,16 @@ function PantallaUsuarios() {
           mostrar: (f) => (f.tieneClave ? "Sí" : "Solo tarjeta"),
         },
         { nombre: "nfcUid", titulo: "UID de la tarjeta NFC", opcional: true, mostrar: (f) => f.nfcUid ?? "—" },
+        {
+          nombre: "activo",
+          titulo: "Activo",
+          tipo: "select",
+          opciones: [
+            { valor: "true", texto: "Sí" },
+            { valor: "false", texto: "No" },
+          ],
+          mostrar: (f) => (f.activo ? "Sí" : "No"),
+        },
       ]}
     />
   );
@@ -441,7 +660,7 @@ export function App() {
         {pantalla === "usuarios" ? (
           <PantallaUsuarios />
         ) : evento ? (
-          <PantallaEvento evento={evento} alCambiar={cargarEvento} />
+          <PantallaEvento evento={evento} alCambiar={cargarEvento} rol={yo.usuario.rol} />
         ) : (
           <PantallaEventos alElegir={setEventoId} />
         )}

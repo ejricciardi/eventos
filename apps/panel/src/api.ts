@@ -55,3 +55,8 @@ export async function api<T>(metodo: string, ruta: string, cuerpo?: unknown): Pr
 
 export const pesos = (centavos: number) =>
   (centavos / 100).toLocaleString("es-AR", { style: "currency", currency: "ARS" });
+
+export const fecha = (iso: string) =>
+  new Date(iso).toLocaleString("es-AR", { dateStyle: "short", timeStyle: "short", hour12: false });
+
+export const hora = (iso: string) => new Date(iso).toLocaleTimeString("es-AR", { timeStyle: "short", hour12: false });

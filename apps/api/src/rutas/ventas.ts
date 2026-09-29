@@ -3,7 +3,17 @@ import { and, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { movimientoStockInput } from "@eventos/shared";
 import type { Contexto } from "../app.js";
-import { movimientosCaja, movimientosStock, pagos, productos, sectores, usuarios, ventaItems, ventas } from "../db/schema.js";
+import {
+  movimientosCaja,
+  movimientosStock,
+  pagos,
+  productos,
+  puntosVenta,
+  sectores,
+  usuarios,
+  ventaItems,
+  ventas,
+} from "../db/schema.js";
 import { ErrorApi } from "../errores.js";
 import {
   arqueos,
@@ -64,9 +74,18 @@ export function rutasVentas(app: FastifyInstance, { db, exigirSupervisor, evento
         .all()
         .map((u) => [u.id, u.nombre]),
     );
+    const puntos = new Map(
+      db
+        .select({ id: puntosVenta.id, nombre: puntosVenta.nombre })
+        .from(puntosVenta)
+        .where(eq(puntosVenta.eventoId, eventoId))
+        .all()
+        .map((p) => [p.id, p.nombre]),
+    );
     return lista.map((v) => ({
       ...v,
       cajero: nombres.get(v.usuarioId) ?? `Usuario ${v.usuarioId}`,
+      puntoVenta: puntos.get(v.puntoVentaId) ?? `Punto ${v.puntoVentaId}`,
       items: items.filter((i) => i.ventaId === v.id),
       pagos: cobros.filter((p) => p.ventaId === v.id),
     }));
