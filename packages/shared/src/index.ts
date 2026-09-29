@@ -17,6 +17,12 @@ export const eventoInput = z.object({
   inicio: z.string().datetime({ offset: true }),
   fin: z.string().datetime({ offset: true }),
   modoVenta: z.enum(MODOS_VENTA).default("vales"),
+  // Vencimiento de los vales: si vencen, lo hacen en valesVencimiento o, si no se fija, al terminar el evento.
+  // Se evalúa al canjear con la configuración vigente, así un cambio vale también para los vales ya impresos.
+  valesVencen: z.boolean().default(true),
+  valesVencimiento: z.string().datetime({ offset: true }).nullable().default(null),
+  // Minutos en los que el cajero puede anular solo; después hace falta un supervisor.
+  minutosAnulacionCajero: z.number().int().min(0).max(240).default(5),
 });
 
 export const impresoraInput = z.object({
@@ -39,7 +45,13 @@ export const productoInput = z.object({
   precio: centavos,
   sectorId: z.number().int().positive().nullable().default(null),
   activo: z.boolean().default(true),
+  // Si controla stock, el posnet avisa cuando se agota (no bloquea: sin conexión no se puede frenar).
+  controlaStock: z.boolean().default(false),
 });
+
+/** Un punto de venta es una caja que cobra o un puesto de canje de vales (una barra). */
+export const TIPOS_PUNTO_VENTA = ["caja", "canje"] as const;
+export const VISTAS_PRODUCTOS = ["lista", "fotos"] as const;
 
 export const puntoVentaInput = z.object({
   nombre: texto,
@@ -47,6 +59,10 @@ export const puntoVentaInput = z.object({
   // null = usar lo que define el modo de venta del evento.
   imprimeVales: z.boolean().nullable().default(null),
   imprimeTicket: z.boolean().default(true),
+  tipo: z.enum(TIPOS_PUNTO_VENTA).default("caja"),
+  // Para un puesto de canje: el sector cuyos vales canjea.
+  sectorId: z.number().int().positive().nullable().default(null),
+  vistaProductos: z.enum(VISTAS_PRODUCTOS).default("lista"),
 });
 
 const nfcUid = z
@@ -101,7 +117,7 @@ export type Evento = EventoInput & { id: number; cuentaId: number };
 export type Impresora = ImpresoraInput & { id: number; eventoId: number };
 export type Sector = SectorInput & { id: number; eventoId: number };
 export type Producto = ProductoInput & { id: number; eventoId: number };
-export type PuntoVenta = PuntoVentaInput & { id: number; eventoId: number };
+export type PuntoVenta = PuntoVentaInput & { id: number; eventoId: number; dispositivoVinculado: boolean };
 /** Usuario tal como lo devuelve la API: sin la clave. */
 export type Usuario = Omit<UsuarioInput, "clave"> & { id: number; cuentaId: number; tieneClave: boolean };
 export type Cuenta = { id: number; nombre: string };
@@ -111,3 +127,11 @@ export type Sesion = { token: string; expira: string; usuario: Usuario; cuenta: 
 export function imprimeVales(evento: Pick<Evento, "modoVenta">, pv: Pick<PuntoVenta, "imprimeVales">): boolean {
   return pv.imprimeVales ?? evento.modoVenta === "vales";
 }
+
+/** Fecha y hora desde la que un vale del evento está vencido, o null si no vence. */
+export function vencimientoVales(evento: Pick<Evento, "valesVencen" | "valesVencimiento" | "fin">): string | null {
+  if (!evento.valesVencen) return null;
+  return evento.valesVencimiento ?? evento.fin;
+}
+
+export * from "./operaciones.js";
