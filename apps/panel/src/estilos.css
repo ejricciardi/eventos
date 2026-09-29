@@ -1,0 +1,24 @@
+:root { font-family: system-ui, sans-serif; color: #1c1c1c; background: #f6f6f4; }
+body { margin: 0; }
+header { background: #1c1c1c; color: #fff; padding: 12px 20px; display: flex; gap: 16px; align-items: center; }
+header button { background: none; border: none; color: #ccc; cursor: pointer; font-size: 15px; }
+header button.activo { color: #fff; font-weight: 600; }
+main { max-width: 960px; margin: 0 auto; padding: 20px 16px; }
+section { background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 2px #0001; }
+h2 { margin-top: 0; font-size: 18px; }
+table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 14px; }
+form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+label { display: flex; flex-direction: column; font-size: 12px; color: #555; gap: 2px; }
+input, select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+button { padding: 7px 12px; border-radius: 6px; border: 1px solid #1c1c1c; background: #1c1c1c; color: #fff; cursor: pointer; }
+button.secundario { background: #fff; color: #1c1c1c; }
+.error { color: #b00020; margin: 8px 0; }
+.lista-eventos li { cursor: pointer; padding: 8px 0; }
+header .espacio { flex: 1; }
+header .quien { color: #ccc; font-size: 14px; }
+form.vertical { flex-direction: column; align-items: stretch; }
+.acceso { max-width: 420px; }
+button.enlace { background: none; border: none; color: #1c1c1c; text-decoration: underline; padding: 0; }
+td .acciones { display: flex; gap: 6px; }
+.aviso { background: #fff8e1; border: 1px solid #f0d58c; border-radius: 6px; padding: 10px; margin: 8px 0; word-break: break-all; }
