@@ -76,8 +76,12 @@ export const usuarios = sqliteTable(
     nfcUid: text("nfc_uid"),
     activo: integer("activo", { mode: "boolean" }).notNull().default(true),
   },
-  // Usuario y tarjeta son únicos en todo el sistema: una tarjeta física es de una sola persona.
-  (t) => [uniqueIndex("usuarios_usuario_unico").on(t.usuario), uniqueIndex("usuarios_nfc_uid_unico").on(t.nfcUid)],
+  // El usuario es único en todo el sistema porque el login no pide la cuenta.
+  // La tarjeta es única dentro de cada cuenta: la misma persona puede trabajar para dos organizadores.
+  (t) => [
+    uniqueIndex("usuarios_usuario_unico").on(t.usuario),
+    uniqueIndex("usuarios_nfc_uid_unico").on(t.cuentaId, t.nfcUid),
+  ],
 );
 
 export const sesiones = sqliteTable(

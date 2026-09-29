@@ -133,11 +133,30 @@ describe("registro y acceso con usuario y clave", () => {
     expect((await como(token)("GET", "/api/yo")).status).toBe(401);
   });
 
-  it("limita los intentos de login por minuto", async () => {
-    await registrar();
+  it("limita los intentos de login por usuario, sin bloquear a los demás de la misma IP", async () => {
+    const admin = como((await registrar()).token);
+    await crearUsuario(admin, { nombre: "Ana", usuario: "ana", rol: "supervisor" });
     const estados = [];
     for (let i = 0; i < 11; i++) estados.push((await login("edu", "clave-mala")).status);
+    expect(estados.slice(0, 10).every((e) => e === 401)).toBe(true);
     expect(estados.at(-1)).toBe(429);
+    expect((await login("ana", "otra-clave-1")).status).toBe(200);
+  });
+
+  it("detrás de un proxy (trustProxy) cuenta los intentos por IP real del cliente", async () => {
+    iniciar({ trustProxy: true });
+    await registrar();
+    const desde = (ip: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/auth/login",
+        remoteAddress: "10.0.0.1",
+        headers: { "x-forwarded-for": ip },
+        payload: { usuario: "edu", clave: "clave-mala" },
+      });
+    for (let i = 0; i < 10; i++) await desde("198.51.100.66");
+    expect((await desde("198.51.100.66")).statusCode).toBe(429);
+    expect((await desde("203.0.113.20")).statusCode).toBe(401);
   });
 });
 
@@ -159,6 +178,20 @@ describe("usuarios de la cuenta", () => {
       (await admin("POST", "/api/usuarios", { nombre: "Beto", usuario: "beto", rol: "cajero", nfcUid: "04A1B2C3" }))
         .status,
     ).toBe(409);
+  });
+
+  it("la misma tarjeta puede estar en dos cuentas distintas", async () => {
+    iniciar({ registroAbierto: true });
+    const adminA = como((await registrar("cuenta-a", "A")).token);
+    const adminB = como((await registrar("cuenta-b", "B")).token);
+    await crearUsuario(adminA, { nombre: "Ana", usuario: "ana-a", rol: "cajero", nfcUid: "04A1B2C3" });
+    const res = await adminB("POST", "/api/usuarios", {
+      nombre: "Ana",
+      usuario: "ana-b",
+      rol: "cajero",
+      nfcUid: "04a1b2c3",
+    });
+    expect(res.status).toBe(201);
   });
 
   it("el admin no se puede quitar el acceso a sí mismo", async () => {
@@ -262,6 +295,22 @@ describe("acceso con tarjeta NFC desde el posnet", () => {
     expect((await loginNfc("clave-inventada", "BBBBBBBB")).status).toBe(401);
     expect((await loginNfc(claveDispositivo, "DEADBEEF")).status).toBe(401);
     expect((await loginNfc(claveDispositivo, "BBBBBBBB")).status).toBe(401);
+  });
+
+  it("en el cambio de turno entran muchos cajeros por la misma IP sin trabarse", async () => {
+    const admin = como((await registrar()).token);
+    const evento = await nuevoEvento(admin);
+    const posnets = [];
+    for (let i = 0; i < 4; i++) posnets.push((await vincularPosnet(admin, evento.id)).claveDispositivo);
+    for (let i = 0; i < 40; i++) {
+      const uid = (0x10000000 + i).toString(16).toUpperCase();
+      await crearUsuario(admin, { nombre: `Cajero ${i}`, usuario: `cajero${i}`, rol: "cajero", nfcUid: uid });
+    }
+    const estados = [];
+    for (let i = 0; i < 40; i++) {
+      estados.push((await loginNfc(posnets[i % 4], (0x10000000 + i).toString(16).toUpperCase())).status);
+    }
+    expect(new Set(estados)).toEqual(new Set([200]));
   });
 
   it("un usuario desactivado no entra con su tarjeta", async () => {

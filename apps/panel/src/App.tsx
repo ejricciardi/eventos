@@ -173,9 +173,15 @@ function PantallaEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () =
 
   const nombreDe = (lista: Opcion[], id: unknown) => lista.find((o) => o.valor === String(id))?.texto ?? "—";
 
+  const [errorModo, setErrorModo] = useState("");
   const cambiarModo = async (modoVenta: string) => {
-    await api("PATCH", base, { modoVenta });
-    alCambiar();
+    try {
+      await api("PATCH", base, { modoVenta });
+      setErrorModo("");
+      alCambiar();
+    } catch (err) {
+      setErrorModo((err as Error).message);
+    }
   };
 
   return (
@@ -192,6 +198,7 @@ function PantallaEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () =
             <option value="directo">Directo (sin vales, comanda al sector)</option>
           </select>
         </label>
+        {errorModo && <p className="error">{errorModo}</p>}
       </section>
       <Recurso
         titulo="Impresoras de comandas"
@@ -381,10 +388,18 @@ export function App() {
       .finally(() => setCargando(false));
   }, []);
 
+  // Al terminar la sesión (salir o vencida) se limpia todo, para que quien entre después no vea la pantalla anterior.
+  const limpiar = useCallback(() => {
+    setYo(null);
+    setEventoId(null);
+    setEvento(null);
+    setPantalla("eventos");
+  }, []);
+
   useEffect(() => {
-    alVencerSesion(() => setYo(null));
+    alVencerSesion(limpiar);
     cargarYo();
-  }, [cargarYo]);
+  }, [cargarYo, limpiar]);
 
   const cargarEvento = useCallback(() => {
     if (eventoId) api<Evento>("GET", `/eventos/${eventoId}`).then(setEvento, () => setEvento(null));
@@ -395,9 +410,7 @@ export function App() {
   const salir = async () => {
     await api("POST", "/auth/salir").catch(() => {});
     guardarToken(null);
-    setYo(null);
-    setEventoId(null);
-    setPantalla("eventos");
+    limpiar();
   };
 
   if (cargando) return null;

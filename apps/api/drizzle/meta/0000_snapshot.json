@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "a1e752d8-c136-49c8-b998-d40e2bde894a",
+  "id": "bf7c6828-58e2-42a4-8486-0fa48455866f",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "cuentas": {
@@ -562,6 +562,7 @@
         "usuarios_nfc_uid_unico": {
           "name": "usuarios_nfc_uid_unico",
           "columns": [
+            "cuenta_id",
             "nfc_uid"
           ],
           "isUnique": true

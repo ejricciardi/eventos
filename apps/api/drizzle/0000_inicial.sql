@@ -82,4 +82,4 @@ CREATE TABLE `usuarios` (
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `usuarios_usuario_unico` ON `usuarios` (`usuario`);--> statement-breakpoint
-CREATE UNIQUE INDEX `usuarios_nfc_uid_unico` ON `usuarios` (`nfc_uid`);
+CREATE UNIQUE INDEX `usuarios_nfc_uid_unico` ON `usuarios` (`cuenta_id`,`nfc_uid`);

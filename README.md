@@ -10,7 +10,8 @@ Sistema de gestión de ventas para eventos: se configura desde un panel web y se
   - `vales`: se imprime un vale con QR por producto, que se canjea en el sector.
   - `directo`: se imprime el ticket y la comanda va derecho al sector.
 - **Comandas** a impresoras térmicas de red (ESC/POS: Epson, 3nstar, etc.). La impresora de cada sector es opcional.
-- **Login del staff con tarjeta NFC** (plan B: credencial con QR).
+- **Cuentas:** cada organizador tiene su cuenta, con sus eventos y su gente. Una cuenta no ve los datos de otra.
+- **Acceso:** usuario y clave para el panel; tarjeta NFC en el posnet (plan B: credencial con QR). Con tarjeta se opera, pero no se cambia la configuración.
 - **Funciona sin internet:** cada posnet guarda las ventas localmente y sincroniza cuando vuelve la conexión. En eventos grandes, un servidor local en la red del lugar reparte comandas y valida QR.
 - **A futuro:** app para celulares con promociones, QR de consumo y entradas.
 
@@ -47,5 +48,18 @@ npm run dev:api     # API en http://localhost:3000 (base SQLite en apps/api/even
 npm run dev:panel   # Panel en http://localhost:5173
 npm test            # tests de la API
 ```
+
+La primera vez que abrís el panel te pide crear la cuenta y tu usuario administrador.
+
+Variables de la API:
+
+| Variable | Qué hace |
+|---|---|
+| `DB_PATH` | Archivo de la base SQLite (por defecto `eventos.db`). |
+| `PUERTO` | Puerto de la API (por defecto 3000). |
+| `REGISTRO_ABIERTO=1` | Permite crear más cuentas además de la primera. |
+| `TRUST_PROXY=1` | Usar cuando la API corre detrás de un proxy (en la nube), para limitar los intentos de acceso por la IP real. |
+
+Para que un posnet entre con tarjeta, en el panel tocá **Vincular posnet** en su punto de venta y cargá esa clave en la app del posnet.
 
 Si cambiás `apps/api/src/db/schema.ts`, generá la migración con `npm run db:generate -w @eventos/api`.

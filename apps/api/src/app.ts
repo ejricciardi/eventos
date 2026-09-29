@@ -24,8 +24,29 @@ import { claveFicticia, generarToken, hashearClave, hashToken, verificarClave } 
 
 const idParam = z.coerce.number().int().positive();
 const DURACION_SESION_MS = 12 * 60 * 60 * 1000;
-// Límite de intentos para las rutas de acceso, por IP.
-const LIMITE_ACCESO = { max: 10, timeWindow: "1 minute" };
+
+// Límites de intentos en las rutas de acceso. Se cuentan en preHandler para poder usar el cuerpo del pedido.
+// Login: por IP y usuario, así un atacante no bloquea a todos los que salen por la misma IP (un proxy o el wifi del evento).
+const LIMITE_LOGIN = {
+  max: 10,
+  timeWindow: "1 minute",
+  hook: "preHandler" as const,
+  keyGenerator: (req: FastifyRequest) => {
+    const usuario = (req.body as { usuario?: unknown } | undefined)?.usuario;
+    return `login:${req.ip}:${typeof usuario === "string" ? usuario.trim().toLowerCase() : ""}`;
+  },
+};
+// NFC: por posnet, con margen para el cambio de turno. Una clave de dispositivo inventada no sirve para nada.
+const LIMITE_NFC = {
+  max: 60,
+  timeWindow: "1 minute",
+  hook: "preHandler" as const,
+  keyGenerator: (req: FastifyRequest) => {
+    const clave = req.headers["x-clave-dispositivo"];
+    return typeof clave === "string" && clave ? `nfc:${hashToken(clave)}` : `nfc-ip:${req.ip}`;
+  },
+};
+const LIMITE_REGISTRO = { max: 10, timeWindow: "1 minute" };
 
 class ErrorApi extends Error {
   constructor(
@@ -70,10 +91,12 @@ const puntoVentaPublico = ({ claveDispositivoHash, ...pv }: FilaPuntoVenta) => (
 export type OpcionesApp = {
   /** Permite crear cuentas nuevas. Si no hay ninguna cuenta, el registro siempre está abierto. */
   registroAbierto?: boolean;
+  /** Activar cuando la API corre detrás de un proxy, para que la IP del cliente sea la real y no la del proxy. */
+  trustProxy?: boolean;
 };
 
 export function crearApp(db: Db, opciones: OpcionesApp = {}) {
-  const app = Fastify({ logger: false });
+  const app = Fastify({ logger: false, trustProxy: opciones.trustProxy ?? false });
   app.register(cors);
   app.register(rateLimit, { global: false });
   app.decorateRequest("sesion", null as unknown as SesionActiva);
@@ -147,7 +170,6 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
     };
 
     const publica = { config: { publica: true } };
-    const acceso = { config: { publica: true, rateLimit: LIMITE_ACCESO } };
 
     app.get("/api/salud", publica, async () => ({ ok: true }));
 
@@ -157,7 +179,7 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
 
     app.get("/api/registro", publica, async () => ({ abierto: registroAbierto() }));
 
-    app.post("/api/registro", acceso, async (req, reply) => {
+    app.post("/api/registro", { config: { publica: true, rateLimit: LIMITE_REGISTRO } }, async (req, reply) => {
       const datos = registroInput.parse(req.body);
       const claveHash = await hashearClave(datos.clave);
       // Chequeo e inserción en la misma transacción para que dos registros simultáneos no abran dos cuentas.
@@ -173,7 +195,7 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       return reply.status(201).send(crearSesion(usuario, "clave"));
     });
 
-    app.post("/api/auth/login", acceso, async (req) => {
+    app.post("/api/auth/login", { config: { publica: true, rateLimit: LIMITE_LOGIN } }, async (req) => {
       const { usuario, clave } = loginInput.parse(req.body);
       const fila = db.select().from(usuarios).where(eq(usuarios.usuario, usuario)).get();
       // Se verifica igual contra un hash ficticio para no revelar, por el tiempo de respuesta, si el usuario existe.
@@ -183,7 +205,7 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
     });
 
     // Acceso rápido en el posnet: el dispositivo manda su clave y el UID de la tarjeta apoyada.
-    app.post("/api/auth/nfc", acceso, async (req) => {
+    app.post("/api/auth/nfc", { config: { publica: true, rateLimit: LIMITE_NFC } }, async (req) => {
       const { nfcUid } = loginNfcInput.parse(req.body);
       const claveDispositivo = req.headers["x-clave-dispositivo"];
       if (typeof claveDispositivo !== "string" || !claveDispositivo) {

@@ -1,7 +1,12 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 
-const scryptAsync = promisify(scrypt) as (clave: string, sal: Buffer, largo: number, opciones: object) => Promise<Buffer>;
+const scryptAsync = promisify(scrypt) as (
+  clave: string,
+  sal: Buffer,
+  largo: number,
+  opciones: object,
+) => Promise<Buffer>;
 
 // Parámetros de scrypt. Se guardan junto al hash para poder subirlos más adelante sin romper las claves viejas.
 const N = 16384;

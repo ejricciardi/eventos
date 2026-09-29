@@ -45,7 +45,11 @@ export async function api<T>(metodo: string, ruta: string, cuerpo?: unknown): Pr
     guardarToken(null);
     alVencer();
   }
-  if (!res.ok) throw new Error(datos.error ?? `Error ${res.status}`);
+  if (!res.ok) {
+    // Si la API explica qué campo está mal, se muestra eso en lugar de un "Datos inválidos" genérico.
+    const detalle = Object.values((datos.detalles ?? {}) as Record<string, string[]>).flat()[0];
+    throw new Error(detalle ?? datos.error ?? `Error ${res.status}`);
+  }
   return datos as T;
 }
 
