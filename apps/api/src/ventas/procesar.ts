@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 import {
   claveProducto,
+  MONTO_MAXIMO,
   operacionInput,
   ROLES_CONFIGURACION,
   vencimientoVales,
+  type MedioPago,
   type Operacion,
   type ResultadoOperacion,
 } from "@eventos/shared";
@@ -77,6 +79,7 @@ export function procesarOperacion(db: Db, disp: Dispositivo, crudo: unknown, rec
         : { id: op.id, estado: "invalida", error: previa.error ?? undefined };
     }
     registrarConflicto(db, disp, op.id, op.seq, payload, recibida);
+    ocuparSecuencia(db, disp, op.seq, payload, recibida, "El id de esta operación ya lo usó otra");
     return { id: op.id, estado: "conflicto", error: "Ya llegó una operación con este id y otros datos" };
   }
   const mismaSecuencia = db
@@ -89,14 +92,35 @@ export function procesarOperacion(db: Db, disp: Dispositivo, crudo: unknown, rec
     return { id: op.id, estado: "conflicto", error: `La secuencia ${op.seq} ya la usó otra operación de este posnet` };
   }
 
+  // Se guarda con los datos ya validados, así un reintento de la misma operación da el mismo hash.
   const inconsistencia = validarConsistencia(op);
   if (inconsistencia) {
-    registrarInvalida(db, disp, datos, recibida, inconsistencia);
+    registrarInvalida(db, disp, datos, recibida, inconsistencia, payload);
     return { id: op.id, estado: "invalida", error: inconsistencia };
   }
 
   const observaciones: string[] = [];
   if (disp.revocado) observaciones.push("dispositivo_revocado");
+  try {
+    aplicarYRegistrar(db, disp, op, payload, hash, recibida, observaciones);
+  } catch (err) {
+    // Algo que no se previó no puede trabar al posnet: la operación queda registrada como inválida y sigue el resto.
+    const error = `No se pudo aplicar: ${(err as Error).message}`;
+    registrarInvalida(db, disp, datos, recibida, error, payload);
+    return { id: op.id, estado: "invalida", error };
+  }
+  return { id: op.id, estado: "ok", observaciones: [...new Set(observaciones)] };
+}
+
+function aplicarYRegistrar(
+  db: Db,
+  disp: Dispositivo,
+  op: Operacion,
+  payload: string,
+  hash: string,
+  recibida: string,
+  observaciones: string[],
+) {
   db.transaction((tx) => {
     aplicar(tx, disp, op, observaciones);
     tx.insert(operaciones)
@@ -116,42 +140,96 @@ export function procesarOperacion(db: Db, disp: Dispositivo, crudo: unknown, rec
       })
       .run();
   });
-  return { id: op.id, estado: "ok", observaciones: [...new Set(observaciones)] };
 }
 
-/** Guarda una operación inválida si trae id y secuencia, para que no aparezca como faltante. */
-function registrarInvalida(db: Db, disp: Dispositivo, datos: Record<string, unknown>, recibida: string, error: string) {
-  if (!esUuid(datos.id) || !esSeq(datos.seq)) return;
-  const payload = JSON.stringify(datos);
+/** Id fijo para registrar una secuencia cuya operación no trae un id usable. */
+function idDeSecuencia(dispositivoId: string, seq: number) {
+  const h = sha256(`${dispositivoId}:${seq}`);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
+
+/**
+ * Guarda una operación inválida para que su secuencia no quede como faltante (y el posnet la pueda borrar).
+ * Si el id ya lo usó otra operación, igual ocupa la secuencia con un id propio.
+ */
+function registrarInvalida(
+  db: Db,
+  disp: Dispositivo,
+  datos: Record<string, unknown>,
+  recibida: string,
+  error: string,
+  payload = JSON.stringify(datos),
+) {
+  if (!esSeq(datos.seq)) return;
+  if (!esUuid(datos.id)) {
+    ocuparSecuencia(db, disp, datos.seq, payload, recibida, error, datos);
+    return;
+  }
   const yaEsta = db
-    .select({ id: operaciones.id })
+    .select({ dispositivoId: operaciones.dispositivoId, seq: operaciones.seq })
     .from(operaciones)
     .where(eq(operaciones.id, datos.id))
     .get();
-  const seqUsada = db
-    .select({ id: operaciones.id })
-    .from(operaciones)
-    .where(and(eq(operaciones.dispositivoId, disp.id), eq(operaciones.seq, datos.seq)))
-    .get();
-  if (yaEsta || seqUsada) {
-    if (yaEsta?.id !== datos.id || seqUsada?.id !== datos.id) {
-      registrarConflicto(db, disp, datos.id, datos.seq, payload, recibida);
-    }
+  if (yaEsta) {
+    // La misma operación que ya se había rechazado: no hay nada nuevo que guardar.
+    if (yaEsta.dispositivoId === disp.id && yaEsta.seq === datos.seq) return;
+    registrarConflicto(db, disp, datos.id, datos.seq, payload, recibida);
+    ocuparSecuencia(db, disp, datos.seq, payload, recibida, error, datos);
     return;
   }
+  if (secuenciaUsada(db, disp, datos.seq)) {
+    registrarConflicto(db, disp, datos.id, datos.seq, payload, recibida);
+    return;
+  }
+  insertarInvalida(db, disp, datos.id, datos.seq, datos, payload, recibida, error);
+}
+
+const secuenciaUsada = (db: Db, disp: Dispositivo, seq: number) =>
+  db
+    .select({ id: operaciones.id })
+    .from(operaciones)
+    .where(and(eq(operaciones.dispositivoId, disp.id), eq(operaciones.seq, seq)))
+    .get() !== undefined;
+
+/** Registra la secuencia como inválida con un id propio, si todavía está libre. */
+function ocuparSecuencia(
+  db: Db,
+  disp: Dispositivo,
+  seq: number,
+  payload: string,
+  recibida: string,
+  error: string,
+  datos: Record<string, unknown> = {},
+) {
+  if (secuenciaUsada(db, disp, seq)) return;
+  const id = idDeSecuencia(disp.id, seq);
+  if (db.select({ id: operaciones.id }).from(operaciones).where(eq(operaciones.id, id)).get()) return;
+  insertarInvalida(db, disp, id, seq, datos, payload, recibida, error);
+}
+
+function insertarInvalida(
+  db: Db,
+  disp: Dispositivo,
+  id: string,
+  seq: number,
+  datos: Record<string, unknown>,
+  payload: string,
+  recibida: string,
+  error: string,
+) {
   const creada = typeof datos.creada === "string" && !Number.isNaN(Date.parse(datos.creada)) ? datos.creada : recibida;
   db.insert(operaciones)
     .values({
-      id: datos.id,
+      id,
       dispositivoId: disp.id,
       eventoId: disp.eventoId,
-      seq: datos.seq,
+      seq,
       tipo: typeof datos.tipo === "string" ? datos.tipo.slice(0, 40) : "desconocido",
       usuarioId: esSeq(datos.usuarioId) ? datos.usuarioId : null,
       payload,
       hash: sha256(payload),
       estado: "invalida",
-      error,
+      error: error.slice(0, 1000),
       observaciones: [],
       creada,
       recibida,
@@ -160,6 +238,13 @@ function registrarInvalida(db: Db, disp: Dispositivo, datos: Record<string, unkn
 }
 
 function registrarConflicto(db: Db, disp: Dispositivo, id: string, seq: number, payload: string, recibida: string) {
+  // El mismo conflicto reenviado no se vuelve a anotar.
+  const repetido = db
+    .select({ id: conflictos.id })
+    .from(conflictos)
+    .where(and(eq(conflictos.operacionId, id), eq(conflictos.dispositivoId, disp.id), eq(conflictos.payload, payload)))
+    .get();
+  if (repetido) return;
   db.insert(conflictos)
     .values({ operacionId: id, dispositivoId: disp.id, eventoId: disp.eventoId, seq, payload, recibida })
     .run();
@@ -170,6 +255,7 @@ function validarConsistencia(op: Operacion): string | null {
   if (op.tipo === "venta") {
     const total = op.items.reduce((s, i) => s + i.precioUnitario * i.cantidad, 0);
     const pagado = op.pagos.reduce((s, p) => s + p.monto, 0);
+    if (total > MONTO_MAXIMO) return "El total de la venta supera el máximo permitido";
     if (pagado !== total) return `Los pagos (${pagado}) no suman el total de la venta (${total})`;
     const porItem = new Map<number, number>();
     const ids = new Set<string>();
@@ -215,6 +301,81 @@ function aplicar(tx: Tx, disp: Dispositivo, op: Operacion, obs: string[]) {
     else if (t.dispositivoId !== disp.id) obs.push("turno_de_otro_dispositivo");
     return t;
   };
+  // Si este mismo posnet ya había cerrado el turno antes de esta operación (por su número), llegó tarde.
+  const revisarCierre = (turno: typeof turnos.$inferSelect | undefined) => {
+    if (turno?.seqCierre != null && turno.dispositivoCierreId === disp.id && turno.seqCierre < op.seq) {
+      obs.push("turno_cerrado");
+    }
+  };
+
+  /** Controles de una anulación contra su venta: al llegar la anulación o, si llegó antes, al llegar la venta. */
+  const revisarAnulacion = (
+    venta: typeof ventas.$inferSelect,
+    a: {
+      dispositivoId: string;
+      usuarioId: number;
+      autorizadoPorId?: number | null;
+      creada: string;
+      valesRecuperados: string[];
+      devoluciones: { medio: MedioPago; monto: number }[];
+    },
+  ) => {
+    if (venta.dispositivoId !== a.dispositivoId) obs.push("anulada_en_otro_dispositivo");
+
+    // Sin supervisor, el cajero solo puede anular dentro del plazo que fija el evento.
+    const autorizada = esSupervisor(a.autorizadoPorId ?? undefined) || esSupervisor(a.usuarioId);
+    const evento = tx
+      .select({ minutos: eventos.minutosAnulacionCajero })
+      .from(eventos)
+      .where(eq(eventos.id, venta.eventoId))
+      .get()!;
+    if (!autorizada && minutosEntre(venta.creada, a.creada) > evento.minutos) obs.push("fuera_de_plazo");
+
+    const valesVenta = tx
+      .select({ id: vales.id })
+      .from(vales)
+      .where(and(eq(vales.eventoId, venta.eventoId), eq(vales.ventaId, venta.id)))
+      .all()
+      .map((v) => v.id);
+    const recuperados = new Set(a.valesRecuperados);
+    if (valesVenta.some((id) => !recuperados.has(id))) obs.push("vale_no_recuperado");
+    const canjeado =
+      valesVenta.length > 0 &&
+      tx
+        .select({ id: canjes.id })
+        .from(canjes)
+        .innerJoin(eventos, eq(eventos.id, canjes.eventoId))
+        .where(
+          and(
+            inArray(canjes.valeId, valesVenta),
+            eq(canjes.eventoValeId, venta.eventoId),
+            eq(eventos.cuentaId, disp.cuentaId),
+          ),
+        )
+        .get();
+    if (canjeado) obs.push("anulacion_con_vale_canjeado");
+
+    // Lo devuelto tiene que coincidir con lo cobrado, medio por medio (no se devuelve en efectivo lo que se cobró con tarjeta).
+    const devuelto = a.devoluciones.reduce((s, d) => s + d.monto, 0);
+    if (devuelto !== venta.total) obs.push("devolucion_distinta");
+    const cobradoPorMedio = new Map<string, number>();
+    for (const p of tx.select({ medio: pagos.medio, monto: pagos.monto }).from(pagos).where(eq(pagos.ventaId, venta.id)).all()) {
+      cobradoPorMedio.set(p.medio, (cobradoPorMedio.get(p.medio) ?? 0) + p.monto);
+    }
+    const devueltoPorMedio = new Map<string, number>();
+    for (const d of a.devoluciones) devueltoPorMedio.set(d.medio, (devueltoPorMedio.get(d.medio) ?? 0) + d.monto);
+    if ([...devueltoPorMedio].some(([medio, monto]) => monto > (cobradoPorMedio.get(medio) ?? 0))) {
+      obs.push("devolucion_otro_medio");
+    }
+  };
+
+  const marcarAnulada = (venta: { id: string; eventoId: number }) => {
+    tx.update(ventas).set({ estado: "anulada" }).where(eq(ventas.id, venta.id)).run();
+    tx.update(vales)
+      .set({ estado: "anulado" })
+      .where(and(eq(vales.eventoId, venta.eventoId), eq(vales.ventaId, venta.id)))
+      .run();
+  };
 
   switch (op.tipo) {
     case "apertura_turno": {
@@ -228,6 +389,10 @@ function aplicar(tx: Tx, disp: Dispositivo, op: Operacion, obs: string[]) {
         .get();
       if (otroAbierto) obs.push("otro_turno_abierto");
       const existente = tx.select().from(turnos).where(eq(turnos.id, op.turnoId)).get();
+      if (existente && existente.eventoId !== disp.eventoId) {
+        obs.push("turno_de_otro_evento");
+        return;
+      }
       if (existente && existente.aperturaRecibida) {
         obs.push("turno_repetido");
         return;
@@ -261,7 +426,7 @@ function aplicar(tx: Tx, disp: Dispositivo, op: Operacion, obs: string[]) {
       const turno = buscarTurno(op.turnoId);
       if (turno) {
         if (turno.usuarioId !== op.usuarioId) obs.push("cajero_distinto");
-        if (turno.seqCierre !== null && turno.seqCierre < op.seq) obs.push("turno_cerrado");
+        revisarCierre(turno);
       }
 
       const idsProductos = [...new Set(op.items.map((i) => i.productoId))];
@@ -354,7 +519,13 @@ function aplicar(tx: Tx, disp: Dispositivo, op: Operacion, obs: string[]) {
         if (!coincide) obs.push("vale_inconsistente");
         const firmado = !!qr && firmaValida(qr, disp.clavePublica);
         if (!firmado) obs.push("firma_invalida");
-        if (tx.select({ id: vales.id }).from(vales).where(eq(vales.id, v.valeId)).get()) {
+        if (
+          tx
+            .select({ id: vales.id })
+            .from(vales)
+            .where(and(eq(vales.eventoId, disp.eventoId), eq(vales.id, v.valeId)))
+            .get()
+        ) {
           obs.push("vale_repetido");
           continue;
         }
@@ -373,62 +544,36 @@ function aplicar(tx: Tx, disp: Dispositivo, op: Operacion, obs: string[]) {
           })
           .run();
       }
+
+      // La anulación pudo llegar antes que la venta (por ejemplo, la subió otro posnet que se conectó primero).
+      const anulacionPrevia = tx
+        .select()
+        .from(anulaciones)
+        .where(and(eq(anulaciones.ventaId, op.ventaId), eq(anulaciones.eventoId, disp.eventoId)))
+        .get();
+      if (anulacionPrevia) {
+        obs.push("venta_anulada_antes_de_llegar");
+        const venta = tx.select().from(ventas).where(eq(ventas.id, op.ventaId)).get()!;
+        revisarAnulacion(venta, {
+          ...anulacionPrevia,
+          devoluciones: tx.select().from(devoluciones).where(eq(devoluciones.anulacionId, anulacionPrevia.id)).all(),
+        });
+        marcarAnulada(venta);
+      }
       return;
     }
 
     case "anulacion": {
       revisarUsuario(op.usuarioId);
-      buscarTurno(op.turnoId);
+      revisarCierre(buscarTurno(op.turnoId));
       const venta = tx.select().from(ventas).where(eq(ventas.id, op.ventaId)).get();
       if (!venta || venta.eventoId !== disp.eventoId) {
         obs.push("venta_desconocida");
       } else {
         if (venta.estado === "anulada") obs.push("venta_ya_anulada");
-        if (venta.dispositivoId !== disp.id) obs.push("anulada_en_otro_dispositivo");
-
-        // Sin supervisor, el cajero solo puede anular dentro del plazo que fija el evento.
-        const autorizada = esSupervisor(op.autorizadoPorId) || esSupervisor(op.usuarioId);
         revisarAutorizacion(op.autorizadoPorId);
-        const evento = tx
-          .select({ minutos: eventos.minutosAnulacionCajero })
-          .from(eventos)
-          .where(eq(eventos.id, disp.eventoId))
-          .get()!;
-        if (!autorizada && minutosEntre(venta.creada, op.creada) > evento.minutos) obs.push("fuera_de_plazo");
-
-        const valesVenta = tx.select({ id: vales.id }).from(vales).where(eq(vales.ventaId, venta.id)).all();
-        const recuperados = new Set(op.valesRecuperados);
-        if (valesVenta.some((v) => !recuperados.has(v.id))) obs.push("vale_no_recuperado");
-        if (
-          valesVenta.length > 0 &&
-          tx
-            .select({ id: canjes.id })
-            .from(canjes)
-            .where(
-              inArray(
-                canjes.valeId,
-                valesVenta.map((v) => v.id),
-              ),
-            )
-            .get()
-        ) {
-          obs.push("anulacion_con_vale_canjeado");
-        }
-
-        const devuelto = op.devoluciones.reduce((s, d) => s + d.monto, 0);
-        if (devuelto !== venta.total) obs.push("devolucion_distinta");
-        const mediosCobrados = new Set(
-          tx
-            .select({ medio: pagos.medio })
-            .from(pagos)
-            .where(eq(pagos.ventaId, venta.id))
-            .all()
-            .map((p) => p.medio),
-        );
-        if (op.devoluciones.some((d) => !mediosCobrados.has(d.medio))) obs.push("devolucion_otro_medio");
-
-        tx.update(ventas).set({ estado: "anulada" }).where(eq(ventas.id, venta.id)).run();
-        tx.update(vales).set({ estado: "anulado" }).where(eq(vales.ventaId, venta.id)).run();
+        revisarAnulacion(venta, { ...op, dispositivoId: disp.id });
+        marcarAnulada(venta);
       }
       tx.insert(anulaciones)
         .values({
@@ -455,8 +600,11 @@ function aplicar(tx: Tx, disp: Dispositivo, op: Operacion, obs: string[]) {
 
     case "movimiento_caja": {
       revisarUsuario(op.usuarioId);
-      const turno = buscarTurno(op.turnoId);
-      if (turno?.seqCierre != null && turno.seqCierre < op.seq) obs.push("turno_cerrado");
+      if (tx.select({ id: movimientosCaja.id }).from(movimientosCaja).where(eq(movimientosCaja.id, op.movimientoId)).get()) {
+        obs.push("movimiento_repetido");
+        return;
+      }
+      revisarCierre(buscarTurno(op.turnoId));
       if (op.movimiento === "retiro" && !esSupervisor(op.autorizadoPorId) && !esSupervisor(op.usuarioId)) {
         obs.push("falta_autorizacion");
       } else revisarAutorizacion(op.autorizadoPorId);
@@ -496,6 +644,8 @@ function aplicar(tx: Tx, disp: Dispositivo, op: Operacion, obs: string[]) {
           .run();
         turno = tx.select().from(turnos).where(eq(turnos.id, op.turnoId)).get()!;
       }
+      // Un turno de otro evento no se toca (queda la observación).
+      if (turno.eventoId !== disp.eventoId) return;
       if (turno.seqCierre !== null) {
         obs.push("turno_ya_cerrado");
         return;
@@ -509,6 +659,7 @@ function aplicar(tx: Tx, disp: Dispositivo, op: Operacion, obs: string[]) {
           cantidadVentasDeclarada: op.cantidadVentas,
           totalesDeclarados: op.totalesPorMedio,
           seqCierre: op.seq,
+          dispositivoCierreId: disp.id,
         })
         .where(eq(turnos.id, op.turnoId))
         .run();
@@ -517,6 +668,10 @@ function aplicar(tx: Tx, disp: Dispositivo, op: Operacion, obs: string[]) {
 
     case "canje": {
       revisarUsuario(op.usuarioId);
+      if (tx.select({ id: canjes.id }).from(canjes).where(eq(canjes.id, op.canjeId)).get()) {
+        obs.push("canje_repetido");
+        return;
+      }
       const qr = leerQr(op.qr)!;
       const evaluacion = evaluarCanje(tx, disp, qr, op.creada);
       obs.push(...evaluacion.observaciones);
@@ -549,8 +704,21 @@ export type EvaluacionCanje = {
 };
 
 /**
+ * Producto de una lista que corresponde a otro (mismo código o, sin código, mismo nombre).
+ * Si hay varios, prefiere uno disponible. Lo usan el canje en línea y la configuración que baja al posnet.
+ */
+export function productoEquivalente<P extends { codigo: string | null; nombre: string; activo: boolean }>(
+  lista: P[],
+  original: { codigo: string | null; nombre: string },
+): P | undefined {
+  const clave = claveProducto(original);
+  return [...lista].sort((a, b) => Number(b.activo) - Number(a.activo)).find((p) => claveProducto(p) === clave);
+}
+
+/**
  * Revisa un vale leído en una barra: firma, evento, sector, vencimiento, si está anulado o ya se canjeó.
  * Lo usa el canje que sube la barra y la consulta en línea antes de entregar.
+ * Solo mira vales y canjes de la cuenta del posnet: lo que haga otra cuenta con un id ajeno no afecta.
  */
 export function evaluarCanje(tx: Tx, disp: Dispositivo, qr: QrLeido, momento: string): EvaluacionCanje {
   const obs: string[] = [];
@@ -567,27 +735,33 @@ export function evaluarCanje(tx: Tx, disp: Dispositivo, qr: QrLeido, momento: st
   if (!firmado) obs.push("firma_invalida");
 
   const eventoVale = tx.select().from(eventos).where(eq(eventos.id, c.e)).get();
-  let productoId: number | null = null;
-  let sectorEsperado: number | null = null;
   if (!eventoVale || eventoVale.cuentaId !== disp.cuentaId) {
     obs.push("vale_de_otra_cuenta");
-  } else if (c.e === disp.eventoId) {
-    productoId = c.p;
+    return { firmaValida: firmado, productoId: null, observaciones: obs };
+  }
+
+  let productoId: number | null = null;
+  let sectorEsperado: number | null = null;
+  const productosAca = () => tx.select().from(productos).where(eq(productos.eventoId, disp.eventoId)).all();
+  if (c.e === disp.eventoId) {
+    const producto = tx
+      .select({ id: productos.id })
+      .from(productos)
+      .where(and(eq(productos.id, c.p), eq(productos.eventoId, disp.eventoId)))
+      .get();
+    if (!producto) obs.push("producto_desconocido");
+    else productoId = producto.id;
     sectorEsperado = c.s;
   } else if (eventoVale.valesValidez !== "sin_vencimiento") {
     obs.push("vale_de_otro_evento");
   } else {
     // Vale sin vencimiento de otro evento: se entrega el mismo producto de este evento (por código o nombre).
-    const original = tx.select().from(productos).where(eq(productos.id, c.p)).get();
-    const clave = original ? claveProducto(original) : null;
-    const equivalente = clave
-      ? tx
-          .select()
-          .from(productos)
-          .where(eq(productos.eventoId, disp.eventoId))
-          .all()
-          .find((p) => claveProducto(p) === clave)
-      : undefined;
+    const original = tx
+      .select()
+      .from(productos)
+      .where(and(eq(productos.id, c.p), eq(productos.eventoId, c.e)))
+      .get();
+    const equivalente = original ? productoEquivalente(productosAca(), original) : undefined;
     if (!equivalente) obs.push("producto_no_equivalente");
     else {
       productoId = equivalente.id;
@@ -595,18 +769,31 @@ export function evaluarCanje(tx: Tx, disp: Dispositivo, qr: QrLeido, momento: st
     }
   }
 
-  if (eventoVale) {
-    const vence = vencimientoVales(eventoVale);
-    if (vence && new Date(momento) > new Date(vence)) obs.push("vale_vencido");
-  }
+  const vence = vencimientoVales(eventoVale);
+  if (vence && new Date(momento) > new Date(vence)) obs.push("vale_vencido");
   if (disp.sectorPuntoVenta !== null && sectorEsperado !== null && sectorEsperado !== disp.sectorPuntoVenta) {
     obs.push("otro_sector");
   }
 
-  const vale = tx.select({ estado: vales.estado }).from(vales).where(eq(vales.id, c.i)).get();
+  const vale = tx
+    .select({ estado: vales.estado })
+    .from(vales)
+    .where(and(eq(vales.eventoId, c.e), eq(vales.id, c.i)))
+    .get();
   if (!vale) obs.push("vale_sin_venta");
   else if (vale.estado === "anulado") obs.push("vale_anulado");
-  if (tx.select({ id: canjes.id }).from(canjes).where(eq(canjes.valeId, c.i)).get()) obs.push("canje_duplicado");
+  if (canjePrevio(tx, disp.cuentaId, c.e, c.i)) obs.push("canje_duplicado");
 
   return { firmaValida: firmado, productoId, observaciones: obs };
+}
+
+/** Primer canje de un vale hecho en algún evento de la cuenta, o undefined. */
+export function canjePrevio(tx: Tx, cuentaId: number, eventoValeId: number, valeId: string) {
+  return tx
+    .select({ id: canjes.id, creada: canjes.creada, puntoVentaId: canjes.puntoVentaId })
+    .from(canjes)
+    .innerJoin(eventos, eq(eventos.id, canjes.eventoId))
+    .where(and(eq(canjes.valeId, valeId), eq(canjes.eventoValeId, eventoValeId), eq(eventos.cuentaId, cuentaId)))
+    .orderBy(canjes.creada)
+    .get();
 }

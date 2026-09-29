@@ -17,6 +17,7 @@ import {
 import { ErrorApi } from "../errores.js";
 import {
   arqueos,
+  nombresDeUsuarios,
   reporteAnulaciones,
   reporteObservaciones,
   reporteSincronizacion,
@@ -43,7 +44,7 @@ export function rutasVentas(app: FastifyInstance, { db, exigirSupervisor, evento
     return eventoDeRuta(req);
   };
 
-  app.get(`${base}/turnos`, async (req) => arqueos(db, evento(req).id));
+  app.get(`${base}/turnos`, async (req) => arqueos(db, evento(req).id, req.sesion.cuentaId));
 
   // Últimas ventas, con sus ítems y pagos. Se puede filtrar por turno o por punto de venta.
   app.get(`${base}/ventas`, async (req) => {
@@ -66,13 +67,10 @@ export function rutasVentas(app: FastifyInstance, { db, exigirSupervisor, evento
     const ids = lista.map((v) => v.id);
     const items = db.select().from(ventaItems).where(inArray(ventaItems.ventaId, ids)).all();
     const cobros = db.select().from(pagos).where(inArray(pagos.ventaId, ids)).all();
-    const nombres = new Map(
-      db
-        .select({ id: usuarios.id, nombre: usuarios.nombre })
-        .from(usuarios)
-        .where(inArray(usuarios.id, [...new Set(lista.map((v) => v.usuarioId))]))
-        .all()
-        .map((u) => [u.id, u.nombre]),
+    const nombres = nombresDeUsuarios(
+      db,
+      req.sesion.cuentaId,
+      lista.map((v) => v.usuarioId),
     );
     const puntos = new Map(
       db
@@ -102,10 +100,10 @@ export function rutasVentas(app: FastifyInstance, { db, exigirSupervisor, evento
       .all();
   });
 
-  app.get(`${base}/reportes/ventas`, async (req) => reporteVentas(db, evento(req).id));
+  app.get(`${base}/reportes/ventas`, async (req) => reporteVentas(db, evento(req).id, req.sesion.cuentaId));
   app.get(`${base}/reportes/stock`, async (req) => reporteStock(db, evento(req).id));
-  app.get(`${base}/reportes/vales`, async (req) => reporteVales(db, evento(req).id));
-  app.get(`${base}/reportes/anulaciones`, async (req) => reporteAnulaciones(db, evento(req).id));
+  app.get(`${base}/reportes/vales`, async (req) => reporteVales(db, evento(req).id, req.sesion.cuentaId));
+  app.get(`${base}/reportes/anulaciones`, async (req) => reporteAnulaciones(db, evento(req).id, req.sesion.cuentaId));
   app.get(`${base}/reportes/observaciones`, async (req) => reporteObservaciones(db, evento(req).id));
   app.get(`${base}/reportes/sincronizacion`, async (req) => reporteSincronizacion(db, evento(req).id));
 

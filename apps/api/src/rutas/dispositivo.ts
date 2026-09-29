@@ -5,7 +5,6 @@ import { z } from "zod";
 import { claveProducto, imprimeVales, sincronizacionInput, vencimientoVales } from "@eventos/shared";
 import type { Db } from "../db/index.js";
 import {
-  canjes,
   dispositivos,
   eventos,
   impresoras,
@@ -18,8 +17,8 @@ import {
 } from "../db/schema.js";
 import { ErrorApi } from "../errores.js";
 import { hashToken, parametrosNfc } from "../seguridad.js";
-import { clavePublicaValida, leerQr } from "../ventas/firma.js";
-import { evaluarCanje, procesarOperacion, type Dispositivo } from "../ventas/procesar.js";
+import { clavePublicaValida, leerQr, type QrLeido } from "../ventas/firma.js";
+import { canjePrevio, evaluarCanje, procesarOperacion, type Dispositivo } from "../ventas/procesar.js";
 import { stockActual } from "../ventas/reportes.js";
 
 // Rutas que usa la app del posnet. No van con sesión de usuario sino con la clave del dispositivo
@@ -52,7 +51,9 @@ const RESERVA_CANJE_MS = 60_000;
 
 export function rutasDispositivo(app: FastifyInstance, db: Db) {
   const config = { config: { publica: true, rateLimit: LIMITE_DISPOSITIVO } };
+  // Clave: cuenta, evento del vale e id del vale (el id solo no alcanza: lo genera el posnet y está impreso en el QR).
   const reservas = new Map<string, { dispositivoId: string; hasta: number }>();
+  const claveReserva = (cuentaId: number, qr: QrLeido) => `${cuentaId}:${qr.contenido.e}:${qr.contenido.i}`;
 
   const dispositivoDeClave = (req: FastifyRequest, { permitirRevocado = false } = {}): Dispositivo => {
     const clave = req.headers["x-clave-dispositivo"];
@@ -78,6 +79,7 @@ export function rutasDispositivo(app: FastifyInstance, db: Db) {
     if (fila.revocado && !permitirRevocado) {
       throw new ErrorApi(401, "Este posnet fue desvinculado. Volvé a vincularlo desde el panel.");
     }
+    db.update(dispositivos).set({ ultimoContacto: new Date().toISOString() }).where(eq(dispositivos.id, fila.id)).run();
     return fila;
   };
 
@@ -100,7 +102,8 @@ export function rutasDispositivo(app: FastifyInstance, db: Db) {
       .map((e) => e.id);
     const otrosEventos = eventosCanjeables.filter((id) => id !== evento.id);
 
-    // Para vales sin vencimiento de otros eventos: qué producto de este evento se entrega por cada uno.
+    // Para vales sin vencimiento de otros eventos: qué producto de este evento se entrega por cada uno
+    // (el mismo criterio que productoEquivalente: por código o nombre, prefiriendo uno disponible).
     const aca = new Map<string, number>();
     for (const p of [...todos].sort((a, b) => Number(b.activo) - Number(a.activo))) {
       if (!aca.has(claveProducto(p))) aca.set(claveProducto(p), p.id);
@@ -232,7 +235,7 @@ export function rutasDispositivo(app: FastifyInstance, db: Db) {
         const canje = crudo as { tipo?: unknown; qr?: unknown } | null;
         if (canje?.tipo === "canje" && typeof canje.qr === "string") {
           const qr = leerQr(canje.qr);
-          if (qr) reservas.delete(qr.contenido.i);
+          if (qr) reservas.delete(claveReserva(disp.cuentaId, qr));
         }
       }
 
@@ -267,14 +270,15 @@ export function rutasDispositivo(app: FastifyInstance, db: Db) {
     const ahora = Date.now();
     const evaluacion = evaluarCanje(db, disp, qr, new Date(ahora).toISOString());
     const observaciones = [...evaluacion.observaciones];
-    const reserva = reservas.get(qr.contenido.i);
+    const clave = claveReserva(disp.cuentaId, qr);
+    const reserva = reservas.get(clave);
     if (reserva && reserva.hasta > ahora && reserva.dispositivoId !== disp.id) observaciones.push("canje_en_curso");
 
     const motivos = observaciones.filter((o) => (MOTIVOS_PARA_NO_ENTREGAR as readonly string[]).includes(o));
     const entregar = motivos.length === 0;
     if (entregar) {
       for (const [id, r] of reservas) if (r.hasta <= ahora) reservas.delete(id);
-      reservas.set(qr.contenido.i, { dispositivoId: disp.id, hasta: ahora + RESERVA_CANJE_MS });
+      reservas.set(clave, { dispositivoId: disp.id, hasta: ahora + RESERVA_CANJE_MS });
     }
 
     const producto =
@@ -283,18 +287,20 @@ export function rutasDispositivo(app: FastifyInstance, db: Db) {
         : (db
             .select({ id: productos.id, nombre: productos.nombre })
             .from(productos)
-            .where(eq(productos.id, evaluacion.productoId))
+            .where(and(eq(productos.id, evaluacion.productoId), eq(productos.eventoId, disp.eventoId)))
             .get() ?? null);
     // Si ya se canjeó, dónde y cuándo, para que la barra se lo pueda decir al cliente.
-    const canjePrevio = observaciones.includes("canje_duplicado")
-      ? (db
-          .select({ creada: canjes.creada, puntoVenta: puntosVenta.nombre })
-          .from(canjes)
-          .leftJoin(puntosVenta, eq(puntosVenta.id, canjes.puntoVentaId))
-          .where(eq(canjes.valeId, qr.contenido.i))
-          .orderBy(canjes.creada)
-          .get() ?? null)
+    const previo = observaciones.includes("canje_duplicado")
+      ? canjePrevio(db, disp.cuentaId, qr.contenido.e, qr.contenido.i)
+      : undefined;
+    const canjePrevioInfo = previo
+      ? {
+          creada: previo.creada,
+          puntoVenta:
+            db.select({ nombre: puntosVenta.nombre }).from(puntosVenta).where(eq(puntosVenta.id, previo.puntoVentaId)).get()
+              ?.nombre ?? null,
+        }
       : null;
-    return { entregar, motivos, observaciones, valeId: qr.contenido.i, producto, canjePrevio };
+    return { entregar, motivos, observaciones, valeId: qr.contenido.i, producto, canjePrevio: canjePrevioInfo };
   });
 }

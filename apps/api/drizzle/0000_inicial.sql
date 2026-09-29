@@ -71,6 +71,7 @@ CREATE TABLE `dispositivos` (
 	`creado` text NOT NULL,
 	`revocado` text,
 	`ultima_sincronizacion` text,
+	`ultimo_contacto` text,
 	`desfase_ms` integer,
 	FOREIGN KEY (`punto_venta_id`) REFERENCES `puntos_venta`(`id`) ON UPDATE no action ON DELETE cascade
 );
@@ -230,6 +231,7 @@ CREATE TABLE `turnos` (
 	`cantidad_ventas_declarada` integer,
 	`totales_declarados` text,
 	`seq_cierre` integer,
+	`dispositivo_cierre_id` text,
 	`apertura_recibida` integer DEFAULT true NOT NULL,
 	FOREIGN KEY (`evento_id`) REFERENCES `eventos`(`id`) ON UPDATE no action ON DELETE restrict,
 	FOREIGN KEY (`dispositivo_id`) REFERENCES `dispositivos`(`id`) ON UPDATE no action ON DELETE restrict
@@ -251,7 +253,7 @@ CREATE TABLE `usuarios` (
 CREATE UNIQUE INDEX `usuarios_usuario_unico` ON `usuarios` (`usuario`);--> statement-breakpoint
 CREATE UNIQUE INDEX `usuarios_nfc_uid_unico` ON `usuarios` (`cuenta_id`,`nfc_uid`);--> statement-breakpoint
 CREATE TABLE `vales` (
-	`id` text PRIMARY KEY NOT NULL,
+	`id` text NOT NULL,
 	`evento_id` integer NOT NULL,
 	`venta_id` text NOT NULL,
 	`producto_id` integer NOT NULL,
@@ -261,6 +263,7 @@ CREATE TABLE `vales` (
 	`firma_valida` integer NOT NULL,
 	`estado` text NOT NULL,
 	`emitido` text NOT NULL,
+	PRIMARY KEY(`evento_id`, `id`),
 	FOREIGN KEY (`evento_id`) REFERENCES `eventos`(`id`) ON UPDATE no action ON DELETE restrict,
 	FOREIGN KEY (`venta_id`) REFERENCES `ventas`(`id`) ON UPDATE no action ON DELETE restrict,
 	FOREIGN KEY (`dispositivo_id`) REFERENCES `dispositivos`(`id`) ON UPDATE no action ON DELETE restrict

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "896c732e-2336-4bcd-afd6-04c5aff79e79",
+  "id": "a211cbc0-a8a9-4640-b3bc-89c2e60a4c0b",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "anulaciones": {
@@ -499,6 +499,13 @@
         },
         "ultima_sincronizacion": {
           "name": "ultima_sincronizacion",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "ultimo_contacto": {
+          "name": "ultimo_contacto",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
@@ -1639,6 +1646,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "dispositivo_cierre_id": {
+          "name": "dispositivo_cierre_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "apertura_recibida": {
           "name": "apertura_recibida",
           "type": "integer",
@@ -1791,7 +1805,7 @@
         "id": {
           "name": "id",
           "type": "text",
-          "primaryKey": true,
+          "primaryKey": false,
           "notNull": true,
           "autoincrement": false
         },
@@ -1909,7 +1923,15 @@
           "onUpdate": "no action"
         }
       },
-      "compositePrimaryKeys": {},
+      "compositePrimaryKeys": {
+        "vales_evento_id_id_pk": {
+          "columns": [
+            "evento_id",
+            "id"
+          ],
+          "name": "vales_evento_id_id_pk"
+        }
+      },
       "uniqueConstraints": {},
       "checkConstraints": {}
     },

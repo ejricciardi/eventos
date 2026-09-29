@@ -37,7 +37,7 @@ function convertir(campo: Campo, valor: string, editando: boolean): unknown {
     case "numero":
       return Number(valor);
     case "pesos":
-      return Math.round(Number(valor.replace(",", ".")) * 100);
+      return Math.round(leerPesos(valor) * 100);
     case "fecha":
       return new Date(valor).toISOString();
     case "select":
@@ -46,6 +46,17 @@ function convertir(campo: Campo, valor: string, editando: boolean): unknown {
     default:
       return valor;
   }
+}
+
+/**
+ * Lee un importe escrito como en Argentina: "3.500" es tres mil quinientos y "3.500,50" lleva centavos.
+ * También acepta "3500.50" (punto decimal, sin separador de miles).
+ */
+export function leerPesos(valor: string): number {
+  const v = valor.replace(/[$\s]/g, "");
+  if (v.includes(",")) return Number(v.replace(/\./g, "").replace(",", "."));
+  if (/^\d{1,3}(\.\d{3})+$/.test(v)) return Number(v.replace(/\./g, ""));
+  return Number(v);
 }
 
 /** Valor con el que arranca un campo al editar una fila. */
@@ -98,7 +109,10 @@ function Recurso({
     const datos = new FormData(form);
     const cuerpo: Record<string, unknown> = {};
     for (const c of editables) {
-      const v = convertir(c, String(datos.get(c.nombre) ?? ""), editando !== null);
+      const texto = String(datos.get(c.nombre) ?? "");
+      // Al editar solo se manda lo que cambió: así no se pisa nada que el usuario no tocó.
+      if (editando && texto === valorInicial(c, editando)) continue;
+      const v = convertir(c, texto, editando !== null);
       if (v !== undefined) cuerpo[c.nombre] = v;
     }
     try {
@@ -170,6 +184,12 @@ function Recurso({
             {c.tipo === "select" ? (
               <select name={c.nombre} defaultValue={valorInicial(c, editando)}>
                 {c.opcional && <option value="">{c.textoVacio ?? "(ninguno)"}</option>}
+                {/* Si la lista todavía no cargó, el valor actual igual figura, para no cambiarlo sin querer. */}
+                {editando &&
+                  valorInicial(c, editando) !== "" &&
+                  !c.opciones!.some((o) => o.valor === valorInicial(c, editando)) && (
+                    <option value={valorInicial(c, editando)}>(el actual)</option>
+                  )}
                 {c.opciones!.map((o) => (
                   <option key={o.valor} value={o.valor}>
                     {o.texto}
@@ -468,10 +488,10 @@ function ConfiguracionEvento({ evento, alCambiar }: { evento: Evento; alCambiar:
             mostrar: (f) => (f.vistaProductos === "fotos" ? "Con fotos" : "Lista"),
           },
           {
-            nombre: "ultimaSincronizacion",
+            nombre: "ultimoContacto",
             titulo: "Último contacto",
             soloLectura: true,
-            mostrar: (f) => (f.ultimaSincronizacion ? fecha(f.ultimaSincronizacion) : f.dispositivoVinculado ? "Nunca" : "Sin posnet"),
+            mostrar: (f) => (f.ultimoContacto ? fecha(f.ultimoContacto) : f.dispositivoVinculado ? "Nunca" : "Sin posnet"),
           },
         ]}
       />

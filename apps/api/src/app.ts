@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
-import { and, eq, gt, isNull, lte, ne, or } from "drizzle-orm";
+import { and, eq, gt, inArray, isNotNull, isNull, lte, ne, or, type SQL } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { z, ZodError, type ZodTypeAny } from "zod";
 import {
@@ -290,25 +290,52 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
     };
 
     // Un usuario que vendió, autorizó o canjeó algo queda en los reportes: no se borra, se desactiva.
-    const usuarioConActividad = (id: number) =>
-      [
-        db.select({ x: operaciones.id }).from(operaciones).where(eq(operaciones.usuarioId, id)),
-        db.select({ x: ventas.id }).from(ventas).where(or(eq(ventas.usuarioId, id), eq(ventas.autorizadoPorId, id))),
+    // Solo cuenta lo registrado en eventos de su cuenta (un posnet de otra cuenta podría subir cualquier id).
+    const usuarioConActividad = (id: number, cuentaId: number) => {
+      const deLaCuenta = db.select({ id: eventos.id }).from(eventos).where(eq(eventos.cuentaId, cuentaId));
+      return [
+        db
+          .select({ x: operaciones.id })
+          .from(operaciones)
+          .where(and(eq(operaciones.usuarioId, id), inArray(operaciones.eventoId, deLaCuenta))),
+        db
+          .select({ x: ventas.id })
+          .from(ventas)
+          .where(and(or(eq(ventas.usuarioId, id), eq(ventas.autorizadoPorId, id)), inArray(ventas.eventoId, deLaCuenta))),
         db
           .select({ x: turnos.id })
           .from(turnos)
-          .where(or(eq(turnos.usuarioId, id), eq(turnos.entregadoPorId, id), eq(turnos.cerradoPorId, id))),
+          .where(
+            and(
+              or(eq(turnos.usuarioId, id), eq(turnos.entregadoPorId, id), eq(turnos.cerradoPorId, id)),
+              inArray(turnos.eventoId, deLaCuenta),
+            ),
+          ),
         db
           .select({ x: anulaciones.id })
           .from(anulaciones)
-          .where(or(eq(anulaciones.usuarioId, id), eq(anulaciones.autorizadoPorId, id))),
+          .where(
+            and(
+              or(eq(anulaciones.usuarioId, id), eq(anulaciones.autorizadoPorId, id)),
+              inArray(anulaciones.eventoId, deLaCuenta),
+            ),
+          ),
         db
           .select({ x: movimientosCaja.id })
           .from(movimientosCaja)
-          .where(or(eq(movimientosCaja.usuarioId, id), eq(movimientosCaja.autorizadoPorId, id))),
-        db.select({ x: canjes.id }).from(canjes).where(eq(canjes.usuarioId, id)),
+          .where(
+            and(
+              or(eq(movimientosCaja.usuarioId, id), eq(movimientosCaja.autorizadoPorId, id)),
+              inArray(movimientosCaja.eventoId, deLaCuenta),
+            ),
+          ),
+        db
+          .select({ x: canjes.id })
+          .from(canjes)
+          .where(and(eq(canjes.usuarioId, id), inArray(canjes.eventoId, deLaCuenta))),
         db.select({ x: movimientosStock.id }).from(movimientosStock).where(eq(movimientosStock.usuarioId, id)),
       ].some((q) => q.limit(1).get() !== undefined);
+    };
 
     app.get("/api/usuarios", async (req) => {
       exigirAdmin(req);
@@ -343,12 +370,12 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       }
       if (Object.keys(set).length === 0) return usuarioPublico(actual);
       const actualizado = db.update(usuarios).set(set).where(eq(usuarios.id, id)).returning().get();
-      // Si cambió algo del acceso, se cierran sus otras sesiones.
+      // Si cambió algo del acceso, se cierran sus otras sesiones (editar solo el nombre no lo saca).
       if (
         clave !== undefined ||
-        cambios.rol !== undefined ||
-        cambios.activo !== undefined ||
-        cambios.nfcUid !== undefined
+        (cambios.rol !== undefined && cambios.rol !== actual.rol) ||
+        (cambios.activo !== undefined && cambios.activo !== actual.activo) ||
+        (cambios.nfcUid !== undefined && cambios.nfcUid !== actual.nfcUid)
       ) {
         db.delete(sesiones)
           .where(and(eq(sesiones.usuarioId, id), ne(sesiones.id, req.sesion.id)))
@@ -362,7 +389,7 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       const id = idParam.parse((req.params as { id: string }).id);
       if (id === req.sesion.usuarioId) throw new ErrorApi(400, "No podés borrar tu propio usuario");
       buscarUsuario(id, req.sesion.cuentaId);
-      if (usuarioConActividad(id)) throw new ErrorApi(409, TIENE_OPERACIONES);
+      if (usuarioConActividad(id, req.sesion.cuentaId)) throw new ErrorApi(409, TIENE_OPERACIONES);
       db.delete(usuarios).where(eq(usuarios.id, id)).run();
       return reply.status(204).send();
     });
@@ -422,9 +449,22 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       exigirConfiguracion(req);
       const id = idParam.parse((req.params as { id: string }).id);
       buscarEvento(id, req.sesion.cuentaId);
+      if (posnetUsado(eq(puntosVenta.eventoId, id))) throw new ErrorApi(409, POSNET_USADO);
       db.delete(eventos).where(eq(eventos.id, id)).run();
       return reply.status(204).send();
     });
+
+    // Un posnet que ya se conectó puede tener ventas guardadas sin subir: si se borrara, no las podría subir nunca.
+    const POSNET_USADO =
+      "Tiene un posnet que ya se usó y puede tener ventas sin subir: no se puede borrar.";
+    const posnetUsado = (filtro: SQL | undefined) =>
+      db
+        .select({ id: dispositivos.id })
+        .from(dispositivos)
+        .innerJoin(puntosVenta, eq(puntosVenta.id, dispositivos.puntoVentaId))
+        .where(and(filtro, isNotNull(dispositivos.ultimoContacto)))
+        .limit(1)
+        .get() !== undefined;
 
     // ---- Recursos que pertenecen a un evento ----
     // Cada referencia (sectorId, impresoraId) tiene que apuntar a algo del mismo evento.
@@ -451,7 +491,7 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
         referencias?: Referencias;
         serializar?: (fila: any) => unknown;
         /** Para frenar el borrado de algo que ya se usó en ventas. */
-        antesDeBorrar?: (id: number) => void;
+        antesDeBorrar?: (id: number, eventoId: number) => void;
       } = {},
     ) => {
       const base = `/api/eventos/:eventoId/${ruta}`;
@@ -509,7 +549,7 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
         exigirConfiguracion(req);
         const { eventoId, id } = params(req);
         if (!db.select({ id: tabla.id }).from(tabla).where(filtro(eventoId, id!)).get()) throw noEncontrado(nombre);
-        antesDeBorrar?.(id!);
+        antesDeBorrar?.(id!, eventoId);
         const borrado = db.delete(tabla).where(filtro(eventoId, id!)).returning().get();
         if (!borrado) throw noEncontrado(nombre);
         return reply.status(204).send();
@@ -522,28 +562,48 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
     });
     recursoDeEvento("productos", "Producto", productos, productoInput, {
       referencias: { sectorId: { tabla: sectores, nombre: "El sector" } },
-      antesDeBorrar: (id) => {
+      antesDeBorrar: (id, eventoId) => {
+        // Vendido o canjeado en este evento. (Un vale de este producto canjeado en otro evento existe como vale acá.)
         const usado =
-          db.select({ x: ventaItems.id }).from(ventaItems).where(eq(ventaItems.productoId, id)).limit(1).get() ??
-          db.select({ x: vales.id }).from(vales).where(eq(vales.productoId, id)).limit(1).get() ??
-          db.select({ x: canjes.id }).from(canjes).where(or(eq(canjes.productoId, id), eq(canjes.productoValeId, id))).limit(1).get();
+          db
+            .select({ x: ventaItems.id })
+            .from(ventaItems)
+            .innerJoin(ventas, eq(ventas.id, ventaItems.ventaId))
+            .where(and(eq(ventaItems.productoId, id), eq(ventas.eventoId, eventoId)))
+            .limit(1)
+            .get() ??
+          db
+            .select({ x: vales.id })
+            .from(vales)
+            .where(and(eq(vales.productoId, id), eq(vales.eventoId, eventoId)))
+            .limit(1)
+            .get() ??
+          db
+            .select({ x: canjes.id })
+            .from(canjes)
+            .where(and(eq(canjes.productoId, id), eq(canjes.eventoId, eventoId)))
+            .limit(1)
+            .get();
         if (usado) throw new ErrorApi(409, TIENE_OPERACIONES);
       },
     });
 
     const dispositivoActivo = (puntoVentaId: number) =>
       db
-        .select({ id: dispositivos.id, creado: dispositivos.creado, ultimaSincronizacion: dispositivos.ultimaSincronizacion })
+        .select({ id: dispositivos.id, ultimoContacto: dispositivos.ultimoContacto })
         .from(dispositivos)
         .where(and(eq(dispositivos.puntoVentaId, puntoVentaId), isNull(dispositivos.revocado)))
         .get();
     const puntoVentaPublico = (pv: FilaPuntoVenta) => {
       const disp = dispositivoActivo(pv.id);
-      return { ...pv, dispositivoVinculado: disp !== undefined, ultimaSincronizacion: disp?.ultimaSincronizacion ?? null };
+      return { ...pv, dispositivoVinculado: disp !== undefined, ultimoContacto: disp?.ultimoContacto ?? null };
     };
     recursoDeEvento("puntos-venta", "Punto de venta", puntosVenta, puntoVentaInput, {
       referencias: { sectorId: { tabla: sectores, nombre: "El sector" } },
       serializar: puntoVentaPublico,
+      antesDeBorrar: (id) => {
+        if (posnetUsado(eq(dispositivos.puntoVentaId, id))) throw new ErrorApi(409, POSNET_USADO);
+      },
     });
 
     // Vincula un posnet al punto de venta. La clave se muestra una sola vez y se carga en la app del posnet.

@@ -7,6 +7,7 @@ import {
   conflictos,
   devoluciones,
   dispositivos,
+  eventos,
   movimientosCaja,
   movimientosStock,
   operaciones,
@@ -61,7 +62,7 @@ export type Arqueo = {
  * Efectivo esperado = fondo + efectivo cobrado en el turno (incluidas ventas después anuladas)
  * + ingresos - retiros - efectivo devuelto en el turno.
  */
-export function arqueos(db: Db, eventoId: number): Arqueo[] {
+export function arqueos(db: Db, eventoId: number, cuentaId: number): Arqueo[] {
   const filas = db
     .select({
       turno: turnos,
@@ -70,7 +71,8 @@ export function arqueos(db: Db, eventoId: number): Arqueo[] {
     })
     .from(turnos)
     .innerJoin(puntosVenta, eq(puntosVenta.id, turnos.puntoVentaId))
-    .leftJoin(usuarios, eq(usuarios.id, turnos.usuarioId))
+    // Los nombres solo de la cuenta: un posnet podría subir un id de usuario de otra.
+    .leftJoin(usuarios, and(eq(usuarios.id, turnos.usuarioId), eq(usuarios.cuentaId, cuentaId)))
     .where(eq(turnos.eventoId, eventoId))
     .all();
   if (filas.length === 0) return [];
@@ -134,15 +136,13 @@ export function arqueos(db: Db, eventoId: number): Arqueo[] {
     let estado: Arqueo["estado"] = "abierto";
     let difiere = false;
     if (turno.seqCierre !== null) {
-      // Todas las operaciones del posnet hasta el cierre tienen que haber llegado.
-      const recibidas = db
-        .select({ n: sql<number>`count(*)` })
-        .from(operaciones)
-        .where(and(eq(operaciones.dispositivoId, turno.dispositivoId), lte(operaciones.seq, turno.seqCierre)))
-        .get()!.n;
+      // Todas las operaciones del posnet que cerró, hasta el cierre, tienen que haber llegado.
+      // Si cerró otro posnet, además el del turno no puede tener huecos.
+      const cierre = turno.dispositivoCierreId ?? turno.dispositivoId;
       const completo =
         turno.aperturaRecibida &&
-        recibidas >= turno.seqCierre &&
+        sinHuecosHasta(db, cierre, turno.seqCierre) &&
+        (cierre === turno.dispositivoId || sinHuecosHasta(db, turno.dispositivoId)) &&
         cant.total >= (turno.cantidadVentasDeclarada ?? 0);
       estado = completo ? "cerrado" : "incompleto";
       const declarados = turno.totalesDeclarados ?? {};
@@ -174,17 +174,31 @@ export function arqueos(db: Db, eventoId: number): Arqueo[] {
   });
 }
 
-/** Totales de ventas del evento: generales, por producto, por medio de pago, por punto de venta y por cajero. */
-export function reporteVentas(db: Db, eventoId: number) {
-  const nombres = new Map(
+/** Si llegaron todas las operaciones del posnet desde la 1 hasta `hasta` (o hasta la última que llegó). */
+function sinHuecosHasta(db: Db, dispositivoId: string, hasta?: number) {
+  const { n, ultima } = db
+    .select({ n: sql<number>`count(*)`, ultima: sql<number>`coalesce(max(${operaciones.seq}), 0)` })
+    .from(operaciones)
+    .where(and(eq(operaciones.dispositivoId, dispositivoId), hasta === undefined ? undefined : lte(operaciones.seq, hasta)))
+    .get()!;
+  return n === (hasta ?? ultima);
+}
+
+/** Nombres de los usuarios de la cuenta (un posnet podría subir ids de otra cuenta: esos no se muestran). */
+export function nombresDeUsuarios(db: Db, cuentaId: number, ids: number[]) {
+  if (ids.length === 0) return new Map<number, string>();
+  return new Map(
     db
       .select({ id: usuarios.id, nombre: usuarios.nombre })
       .from(usuarios)
-      .innerJoin(ventas, eq(ventas.usuarioId, usuarios.id))
-      .where(eq(ventas.eventoId, eventoId))
+      .where(and(eq(usuarios.cuentaId, cuentaId), inArray(usuarios.id, [...new Set(ids)])))
       .all()
       .map((u) => [u.id, u.nombre]),
   );
+}
+
+/** Totales de ventas del evento: generales, por producto, por medio de pago, por punto de venta y por cajero. */
+export function reporteVentas(db: Db, eventoId: number, cuentaId: number) {
   const confirmadas = and(eq(ventas.eventoId, eventoId), eq(ventas.estado, "confirmada"));
 
   const totales = db
@@ -238,10 +252,20 @@ export function reporteVentas(db: Db, eventoId: number) {
     .from(ventas)
     .where(confirmadas)
     .groupBy(ventas.usuarioId)
-    .all()
-    .map((c) => ({ ...c, nombre: nombres.get(c.usuarioId) ?? `Usuario ${c.usuarioId}` }));
+    .all();
+  const nombres = nombresDeUsuarios(
+    db,
+    cuentaId,
+    porCajero.map((c) => c.usuarioId),
+  );
 
-  return { ...totales, porProducto, porMedio, porPuntoVenta, porCajero };
+  return {
+    ...totales,
+    porProducto,
+    porMedio,
+    porPuntoVenta,
+    porCajero: porCajero.map((c) => ({ ...c, nombre: nombres.get(c.usuarioId) ?? `Usuario ${c.usuarioId}` })),
+  };
 }
 
 /**
@@ -321,7 +345,7 @@ export function stockActual(db: Db, eventoId: number): Map<number, number> {
 }
 
 /** Estado de los vales del evento y alertas de canje. */
-export function reporteVales(db: Db, eventoId: number) {
+export function reporteVales(db: Db, eventoId: number, cuentaId: number) {
   const porEstado = db
     .select({ estado: vales.estado, cantidad: sql<number>`count(*)` })
     .from(vales)
@@ -331,11 +355,13 @@ export function reporteVales(db: Db, eventoId: number) {
   // Emitidos = vigentes (no anulados). Canjeados cuenta cada vale vigente una vez, aunque se haya leído dos veces.
   const emitidos = porEstado.find((e) => e.estado === "emitido")?.cantidad ?? 0;
   const anulados = porEstado.find((e) => e.estado === "anulado")?.cantidad ?? 0;
+  // Solo canjes hechos en eventos de esta cuenta: un posnet de otra cuenta no puede "gastar" un vale de acá.
+  const eventosCuenta = db.select({ id: eventos.id }).from(eventos).where(eq(eventos.cuentaId, cuentaId));
   const canjeados = db
     .select({ n: sql<number>`count(distinct ${canjes.valeId})` })
     .from(canjes)
-    .innerJoin(vales, eq(vales.id, canjes.valeId))
-    .where(and(eq(vales.eventoId, eventoId), eq(vales.estado, "emitido")))
+    .innerJoin(vales, and(eq(vales.id, canjes.valeId), eq(vales.eventoId, canjes.eventoValeId)))
+    .where(and(eq(vales.eventoId, eventoId), eq(vales.estado, "emitido"), inArray(canjes.eventoId, eventosCuenta)))
     .get()!.n;
   // Canjes de vales de este evento (o hechos en este evento) que el servidor observó: duplicados, vencidos, etc.
   const alertas = db
@@ -343,7 +369,13 @@ export function reporteVales(db: Db, eventoId: number) {
     .from(canjes)
     .innerJoin(operaciones, eq(operaciones.id, canjes.operacionId))
     .leftJoin(puntosVenta, eq(puntosVenta.id, canjes.puntoVentaId))
-    .where(and(or(eq(canjes.eventoId, eventoId), eq(canjes.eventoValeId, eventoId)), sql`${operaciones.observaciones} <> '[]'`))
+    .where(
+      and(
+        or(eq(canjes.eventoId, eventoId), eq(canjes.eventoValeId, eventoId)),
+        inArray(canjes.eventoId, eventosCuenta),
+        sql`${operaciones.observaciones} <> '[]'`,
+      ),
+    )
     .orderBy(canjes.creada)
     .all()
     .map((a) => ({ ...a.canje, puntoVenta: a.puntoVenta, observaciones: a.observaciones }));
@@ -351,25 +383,17 @@ export function reporteVales(db: Db, eventoId: number) {
 }
 
 /** Anulaciones por cajero, con el porcentaje sobre lo que vendió, y el detalle de cada una. */
-export function reporteAnulaciones(db: Db, eventoId: number) {
+export function reporteAnulaciones(db: Db, eventoId: number, cuentaId: number) {
   const lista = db
     .select({ anulacion: anulaciones, venta: ventas })
     .from(anulaciones)
     .leftJoin(ventas, eq(ventas.id, anulaciones.ventaId))
     .where(eq(anulaciones.eventoId, eventoId))
     .all();
-  const nombres = new Map(
-    db
-      .select({ id: usuarios.id, nombre: usuarios.nombre })
-      .from(usuarios)
-      .where(
-        inArray(
-          usuarios.id,
-          [...new Set(lista.flatMap((l) => [l.anulacion.usuarioId, l.anulacion.autorizadoPorId ?? 0]))].concat([0]),
-        ),
-      )
-      .all()
-      .map((u) => [u.id, u.nombre]),
+  const nombres = nombresDeUsuarios(
+    db,
+    cuentaId,
+    lista.flatMap((l) => [l.anulacion.usuarioId, ...(l.anulacion.autorizadoPorId ? [l.anulacion.autorizadoPorId] : [])]),
   );
   const vendido = new Map(
     db

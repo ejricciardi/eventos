@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { OBSERVACIONES, type MedioPago } from "@eventos/shared";
 import { api, fecha, hora, pesos } from "./api";
 
@@ -40,13 +40,18 @@ const observacion = (codigo: string) => OBSERVACIONES[codigo] ?? codigo;
 function useDatos<T>(ruta: string | null) {
   const [datos, setDatos] = useState<T | null>(null);
   const [error, setError] = useState("");
+  // Solo vale la respuesta del último pedido: una lenta de otra ruta no pisa a la actual.
+  const ultimo = useRef(0);
   const recargar = useCallback(async () => {
     if (!ruta) return;
+    const n = ++ultimo.current;
     try {
-      setDatos(await api<T>("GET", ruta));
+      const d = await api<T>("GET", ruta);
+      if (n !== ultimo.current) return;
+      setDatos(d);
       setError("");
     } catch (err) {
-      setError((err as Error).message);
+      if (n === ultimo.current) setError((err as Error).message);
     }
   }, [ruta]);
   useEffect(() => {
@@ -142,8 +147,10 @@ const ESTADOS_TURNO = { abierto: "Abierta", cerrado: "Cerrada", incompleto: "Cer
 
 function Cajas({ base }: { base: string }) {
   const { datos, error } = useDatos<Arqueo[]>(`${base}/turnos`);
-  const [elegido, setElegido] = useState<Arqueo | null>(null);
+  // Se guarda el turno elegido y no la fila, así el detalle se actualiza con cada recarga.
+  const [elegidoId, setElegidoId] = useState<string | null>(null);
   const lista = datos ?? [];
+  const elegido = lista.find((a) => a.turnoId === elegidoId) ?? null;
   const abiertos = lista.filter((a) => a.estado === "abierto").length;
   const diferencias = lista.reduce((s, a) => s + (a.diferencia ?? 0), 0);
 
@@ -184,7 +191,7 @@ function Cajas({ base }: { base: string }) {
               pesos(a.efectivoEsperado),
               a.efectivoDeclarado === null ? "—" : pesos(a.efectivoDeclarado),
               a.diferencia === null ? "—" : <span className={a.diferencia !== 0 ? "negativo" : "ok"}>{pesos(a.diferencia)}</span>,
-              <button className="secundario" onClick={() => setElegido(a)}>
+              <button className="secundario" onClick={() => setElegidoId(a.turnoId)}>
                 Ver
               </button>,
             ];
@@ -192,7 +199,7 @@ function Cajas({ base }: { base: string }) {
         />
         <MensajeError texto={error} />
       </section>
-      {elegido && <DetalleTurno base={base} arqueo={elegido} alCerrar={() => setElegido(null)} />}
+      {elegido && <DetalleTurno base={base} arqueo={elegido} alCerrar={() => setElegidoId(null)} />}
     </>
   );
 }

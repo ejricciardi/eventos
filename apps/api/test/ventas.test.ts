@@ -3,7 +3,6 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { hashNfc } from "../src/seguridad.js";
 import { como, crearUsuario, iniciar, loginNfc, nuevoEvento, pedir, registrar, vincularPosnet } from "./ayuda.js";
 
-type Api = ReturnType<typeof como>;
 
 // Hora base de las operaciones (durante el evento de prueba) y minutos después.
 const HORA = Date.parse("2026-11-02T00:00:00.000Z");
@@ -93,9 +92,12 @@ class Posnet {
   }
 }
 
-/** Evento con barra y cocina, un cajero, un supervisor, una caja y una barra que canjea. */
-async function armarEvento(extraEvento: Record<string, unknown> = {}) {
-  const registro = await registrar();
+/**
+ * Evento con barra y cocina, un cajero, un supervisor, una caja y una barra que canjea.
+ * Con `cuenta`, arma otra cuenta en la misma base (los nombres de usuario son únicos en todo el sistema).
+ */
+async function armarEvento(extraEvento: Record<string, unknown> = {}, cuenta = "") {
+  const registro = await registrar(`edu${cuenta}`, `Producciones ${cuenta || "Edu"}`);
   const admin = como(registro.token);
   const evento = await nuevoEvento(admin, extraEvento);
   const base = `/api/eventos/${evento.id}`;
@@ -106,8 +108,13 @@ async function armarEvento(extraEvento: Record<string, unknown> = {}) {
   ).body;
   const hamburguesa = (await admin("POST", `${base}/productos`, { nombre: "Hamburguesa", precio: 800000, sectorId: cocina.id }))
     .body;
-  const cajero = await crearUsuario(admin, { nombre: "Ana", usuario: "ana", rol: "cajero", nfcUid: "04A1B2C3" });
-  const supervisor = await crearUsuario(admin, { nombre: "Sergio", usuario: "sergio", rol: "supervisor", nfcUid: "05A1B2C3" });
+  const cajero = await crearUsuario(admin, { nombre: `Ana${cuenta}`, usuario: `ana${cuenta}`, rol: "cajero", nfcUid: "04A1B2C3" });
+  const supervisor = await crearUsuario(admin, {
+    nombre: `Sergio${cuenta}`,
+    usuario: `sergio${cuenta}`,
+    rol: "supervisor",
+    nfcUid: "05A1B2C3",
+  });
   const caja = await vincularPosnet(admin, evento.id);
   const posnet = new Posnet(caja.claveDispositivo, caja.dispositivoId, evento.id);
   expect((await posnet.registrarClave()).status).toBe(200);
@@ -463,13 +470,21 @@ describe("canje de vales en la barra", () => {
     expect((await lector.consultar(vale.qr)).body.motivos).toContain("vale_de_otro_evento");
   });
 
-  it("un vale de otra cuenta no sirve", async () => {
+  it("un vale de otra cuenta no sirve, y lo que haga otra cuenta con él no lo gasta acá", async () => {
+    iniciar({ registroAbierto: true });
     const e = await armarEvento();
     const [vale] = await vender(e);
-    iniciar({ registroAbierto: true });
-    const e2 = await armarEvento();
-    const res = (await e2.lectorBarra.consultar(vale.qr)).body;
-    expect(res.entregar).toBe(false);
+    const otra = await armarEvento({}, "otra");
+    expect((await otra.lectorBarra.consultar(vale.qr)).body).toMatchObject({ entregar: false, motivos: ["vale_de_otra_cuenta"] });
+    // La otra cuenta sube un canje con ese vale y una venta que usa el mismo id de vale.
+    await otra.lectorBarra.subir(canje(otra.lectorBarra, vale.qr, otra.cajero.id));
+    const { turnoId, op } = abrirTurno(otra.posnet, otra.cajero.id);
+    const copia = otra.posnet.venta(turnoId, otra.cajero.id, [{ producto: otra.cerveza, cantidad: 1 }]);
+    copia.vales = [{ ...otra.posnet.vale(otra.cerveza.id, otra.barra.id), valeId: vale.valeId, item: 0 }];
+    await otra.posnet.subir(op, copia);
+
+    expect((await e.lectorBarra.consultar(vale.qr)).body).toMatchObject({ entregar: true, motivos: [] });
+    expect((await e.admin("GET", `${e.base}/reportes/vales`)).body).toMatchObject({ emitidos: 1, canjeados: 0, alertas: [] });
   });
 });
 
@@ -538,5 +553,161 @@ describe("permisos y borrados", () => {
     expect(
       (await admin("POST", "/api/eventos", { ...base, valesValidez: "fecha", valesVencimiento: "2026-12-31T23:59:00-03:00" })).status,
     ).toBe(201);
+  });
+});
+
+describe("casos que encontró la revisión", () => {
+  it("si la anulación llega antes que la venta, la venta queda anulada al llegar", async () => {
+    const e = await armarEvento();
+    const { turnoId, op } = abrirTurno(e.posnet, e.cajero.id, 0);
+    const venta = e.posnet.venta(turnoId, e.cajero.id, [{ producto: e.cerveza, cantidad: 2 }], { conVales: true, minuto: 10 });
+
+    // La anula otra caja, que se conecta primero.
+    const otra = await vincularPosnet(e.admin, e.evento.id, { nombre: "Caja 2" });
+    const caja2 = new Posnet(otra.claveDispositivo, otra.dispositivoId, e.evento.id);
+    const turno2 = abrirTurno(caja2, e.supervisor.id, 0);
+    const anulacion = caja2.op(
+      "anulacion",
+      {
+        ventaId: venta.ventaId,
+        turnoId: turno2.turnoId,
+        usuarioId: e.supervisor.id,
+        motivo: "cliente_desiste",
+        valesRecuperados: venta.vales.map((v: { valeId: string }) => v.valeId),
+        devoluciones: [{ medio: "efectivo", monto: 600000 }],
+      },
+      12,
+    );
+    expect((await caja2.subir(turno2.op, anulacion)).resultados[1].observaciones).toEqual(["venta_desconocida"]);
+
+    const { resultados } = await e.posnet.subir(op, venta);
+    expect(resultados[1].observaciones).toEqual(["venta_anulada_antes_de_llegar", "anulada_en_otro_dispositivo"]);
+    expect((await e.admin("GET", `${e.base}/reportes/ventas`)).body).toMatchObject({ ventas: 0, importe: 0, anuladas: 1 });
+    expect((await e.admin("GET", `${e.base}/reportes/vales`)).body).toMatchObject({ emitidos: 0, anulados: 2 });
+    expect((await e.lectorBarra.consultar(venta.vales[0].qr)).body.motivos).toEqual(["vale_anulado"]);
+  });
+
+  it("un retiro o un canje repetido con otro id de operación no traba al posnet", async () => {
+    const e = await armarEvento();
+    const { turnoId, op } = abrirTurno(e.posnet, e.cajero.id);
+    const datos = { movimientoId: randomUUID(), turnoId, movimiento: "ingreso", monto: 1000, motivo: "Cambio", usuarioId: e.cajero.id };
+    await e.posnet.subir(op, e.posnet.op("movimiento_caja", datos));
+    const r = await e.posnet.subir(
+      e.posnet.op("movimiento_caja", datos),
+      e.posnet.venta(turnoId, e.cajero.id, [{ producto: e.cerveza, cantidad: 1 }]),
+    );
+    expect(r.resultados.map((x) => [x.estado, x.observaciones])).toEqual([
+      ["ok", ["movimiento_repetido"]],
+      ["ok", []],
+    ]);
+    expect(r.ultimaSeqContigua).toBe(4);
+    const [arqueo] = (await e.admin("GET", `${e.base}/turnos`)).body;
+    expect(arqueo.ingresos).toBe(1000);
+
+    const [vale] = e.posnet.venta(turnoId, e.cajero.id, [{ producto: e.cerveza, cantidad: 1 }], { conVales: true }).vales;
+    const canjeId = randomUUID();
+    await e.lectorBarra.subir(e.lectorBarra.op("canje", { canjeId, qr: vale.qr, usuarioId: e.cajero.id }));
+    const otra = await e.lectorBarra.subir(e.lectorBarra.op("canje", { canjeId, qr: vale.qr, usuarioId: e.cajero.id }));
+    expect(otra.resultados[0]).toMatchObject({ estado: "ok", observaciones: ["canje_repetido"] });
+  });
+
+  it("rechaza importes absurdos, que romperían las sumas", async () => {
+    const e = await armarEvento();
+    const { turnoId, op } = abrirTurno(e.posnet, e.cajero.id);
+    const venta = e.posnet.venta(turnoId, e.cajero.id, [{ producto: { ...e.cerveza, precio: 5e18 }, cantidad: 1 }]);
+    const { resultados } = await e.posnet.subir(op, venta);
+    expect(resultados[1].estado).toBe("invalida");
+    expect((await e.admin("GET", `${e.base}/turnos`)).status).toBe(200);
+  });
+
+  it("devolver en efectivo lo cobrado con tarjeta queda observado aunque haya habido algo de efectivo", async () => {
+    const e = await armarEvento();
+    const { turnoId, op } = abrirTurno(e.posnet, e.cajero.id, 0);
+    const venta = e.posnet.venta(turnoId, e.cajero.id, [{ producto: e.cerveza, cantidad: 1 }], { minuto: 1 });
+    venta.pagos = [
+      { medio: "debito", monto: 299900 },
+      { medio: "efectivo", monto: 100 },
+    ];
+    const anulacion = e.posnet.op(
+      "anulacion",
+      { ventaId: venta.ventaId, turnoId, usuarioId: e.cajero.id, motivo: "error_de_carga", devoluciones: [{ medio: "efectivo", monto: 300000 }] },
+      2,
+    );
+    const { resultados } = await e.posnet.subir(op, venta, anulacion);
+    expect(resultados[2].observaciones).toEqual(["devolucion_otro_medio"]);
+  });
+
+  it("una anulación posterior al cierre de ese turno queda observada", async () => {
+    const e = await armarEvento();
+    const { turnoId, op } = abrirTurno(e.posnet, e.cajero.id, 0);
+    const venta = e.posnet.venta(turnoId, e.cajero.id, [{ producto: e.cerveza, cantidad: 1 }], { minuto: 1 });
+    const cierre = e.posnet.op("cierre_turno", { turnoId, usuarioId: e.cajero.id, efectivoDeclarado: 300000, cantidadVentas: 1 }, 2);
+    const anulacion = e.posnet.op(
+      "anulacion",
+      { ventaId: venta.ventaId, turnoId, usuarioId: e.cajero.id, motivo: "error_de_carga", devoluciones: [{ medio: "efectivo", monto: 300000 }] },
+      3,
+    );
+    const { resultados } = await e.posnet.subir(op, venta, cierre, anulacion);
+    expect(resultados[3].observaciones).toContain("turno_cerrado");
+  });
+
+  it("los reportes no muestran nombres de usuarios de otra cuenta", async () => {
+    iniciar({ registroAbierto: true });
+    const otra = await armarEvento({}, "otra");
+    const e = await armarEvento();
+    const { turnoId, op } = abrirTurno(e.posnet, otra.cajero.id);
+    await e.posnet.subir(op, e.posnet.venta(turnoId, otra.cajero.id, [{ producto: e.cerveza, cantidad: 1 }]));
+    const texto = JSON.stringify([
+      (await e.admin("GET", `${e.base}/turnos`)).body,
+      (await e.admin("GET", `${e.base}/reportes/ventas`)).body,
+      (await e.admin("GET", `${e.base}/ventas`)).body,
+    ]);
+    expect(texto).not.toContain("Anaotra");
+    expect(texto).toContain(`Usuario ${otra.cajero.id}`);
+    // Y ese id no le impide a la otra cuenta borrar a su usuario.
+    expect((await otra.admin("DELETE", `/api/usuarios/${otra.cajero.id}`)).status).toBe(204);
+  });
+
+  it("una operación sin id usable igual ocupa su número; reintentar una inválida no da conflicto", async () => {
+    const e = await armarEvento();
+    const { turnoId, op } = abrirTurno(e.posnet, e.cajero.id);
+    const mal = e.posnet.venta(turnoId, e.cajero.id, [{ producto: e.cerveza, cantidad: 1 }]);
+    mal.pagos = [{ medio: "efectivo", monto: 1 }];
+    const sinId = { ...e.posnet.op("venta", {}), id: "no-es-uuid" };
+    const r = await e.posnet.subir(op, mal, sinId);
+    expect(r.resultados.map((x) => x.estado)).toEqual(["ok", "invalida", "invalida"]);
+    expect(r.ultimaSeqContigua).toBe(3);
+    const reintento = await e.posnet.subir(mal);
+    expect(reintento.resultados[0].estado).toBe("invalida");
+    expect((await e.admin("GET", `${e.base}/reportes/observaciones`)).body.conflictos).toEqual([]);
+  });
+
+  it("no se borra un punto de venta cuyo posnet ya se usó (puede tener ventas sin subir)", async () => {
+    const e = await armarEvento();
+    await e.posnet.pedir("GET", "/api/dispositivo/configuracion");
+    expect((await e.admin("DELETE", `${e.base}/puntos-venta/${e.caja.pv.id}`)).status).toBe(409);
+    expect((await e.admin("DELETE", `/api/eventos/${e.evento.id}`)).status).toBe(409);
+    // Uno vinculado pero que nunca se conectó sí se puede borrar.
+    const nuevo = await vincularPosnet(e.admin, e.evento.id, { nombre: "Caja sin usar" });
+    expect((await e.admin("DELETE", `${e.base}/puntos-venta/${nuevo.pv.id}`)).status).toBe(204);
+  });
+
+  it("cambiar solo el nombre de un usuario no le cierra la sesión", async () => {
+    const e = await armarEvento();
+    const token = (await loginNfc(e.caja.claveDispositivo, "04A1B2C3")).body.token;
+    await e.admin("PATCH", `/api/usuarios/${e.cajero.id}`, { nombre: "Ana María", rol: "cajero", activo: true });
+    expect((await como(token)("GET", "/api/yo")).status).toBe(200);
+    await e.admin("PATCH", `/api/usuarios/${e.cajero.id}`, { rol: "despacho" });
+    expect((await como(token)("GET", "/api/yo")).status).toBe(401);
+  });
+
+  it("un QR falso de este evento no revela productos de otra cuenta", async () => {
+    iniciar({ registroAbierto: true });
+    const otra = await armarEvento({}, "otra");
+    const e = await armarEvento();
+    const falso = e.posnet.vale(otra.hamburguesa.id, null);
+    const res = (await e.lectorBarra.consultar(falso.qr)).body;
+    expect(res.producto).toBeNull();
+    expect(res.observaciones).toContain("producto_desconocido");
   });
 });

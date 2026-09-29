@@ -1,4 +1,4 @@
-import { sqliteTable, integer, text, uniqueIndex, index } from "drizzle-orm/sqlite-core";
+import { sqliteTable, integer, text, uniqueIndex, index, primaryKey } from "drizzle-orm/sqlite-core";
 import {
   MEDIOS_PAGO,
   MODOS_VENTA,
@@ -95,6 +95,8 @@ export const dispositivos = sqliteTable("dispositivos", {
   creado: text("creado").notNull(),
   revocado: text("revocado"),
   ultimaSincronizacion: text("ultima_sincronizacion"),
+  // Última vez que el posnet habló con el servidor por cualquier motivo (bajar configuración, subir, consultar).
+  ultimoContacto: text("ultimo_contacto"),
   // Cuánto adelanta (+) o atrasa (-) el reloj del posnet respecto del servidor.
   desfaseMs: integer("desfase_ms"),
 });
@@ -197,8 +199,9 @@ export const turnos = sqliteTable("turnos", {
   efectivoDeclarado: integer("efectivo_declarado"),
   cantidadVentasDeclarada: integer("cantidad_ventas_declarada"),
   totalesDeclarados: text("totales_declarados", { mode: "json" }).$type<Record<string, number>>(),
-  // Secuencia de la operación de cierre: todo lo anterior de ese posnet tiene que haber llegado.
+  // Secuencia de la operación de cierre y posnet que la hizo: todo lo anterior de ese posnet tiene que haber llegado.
   seqCierre: integer("seq_cierre"),
+  dispositivoCierreId: text("dispositivo_cierre_id"),
   // false si el turno se conoció por su cierre y la apertura todavía no llegó.
   aperturaRecibida: integer("apertura_recibida", { mode: "boolean" }).notNull().default(true),
 });
@@ -259,10 +262,14 @@ export const pagos = sqliteTable(
   (t) => [index("pagos_venta").on(t.ventaId)],
 );
 
+/**
+ * Vales emitidos. El id lo genera el posnet y viaja en el QR, así que cualquiera que vea un vale lo conoce:
+ * se identifica junto con el evento, para que un posnet de otra cuenta no pueda ocupar ese id.
+ */
 export const vales = sqliteTable(
   "vales",
   {
-    id: text("id").primaryKey(),
+    id: text("id").notNull(),
     eventoId: eventoOp(),
     ventaId: text("venta_id")
       .notNull()
@@ -275,7 +282,7 @@ export const vales = sqliteTable(
     estado: text("estado", { enum: ["emitido", "anulado"] }).notNull(),
     emitido: text("emitido").notNull(),
   },
-  (t) => [index("vales_venta").on(t.ventaId)],
+  (t) => [primaryKey({ columns: [t.eventoId, t.id] }), index("vales_venta").on(t.ventaId)],
 );
 
 export const anulaciones = sqliteTable("anulaciones", {

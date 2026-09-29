@@ -9,8 +9,11 @@ export const MOTIVOS_ANULACION = ["error_de_carga", "cliente_desiste", "producto
 export const TIPOS_MOVIMIENTO_CAJA = ["retiro", "ingreso"] as const;
 export const TIPOS_MOVIMIENTO_STOCK = ["carga", "ajuste", "merma"] as const;
 
+/** Tope de cualquier importe, en centavos ($1.000 millones). Evita que un dato absurdo rompa las sumas de los reportes. */
+export const MONTO_MAXIMO = 100_000_000_000;
+
 const uuid = z.string().uuid();
-const monto = z.number().int().nonnegative();
+const monto = z.number().int().nonnegative().max(MONTO_MAXIMO);
 const idUsuario = z.number().int().positive();
 
 const base = {
@@ -67,11 +70,13 @@ export const ventaOp = z.object({
         cantidad: z.number().int().positive().max(1000),
       }),
     )
-    .min(1),
-  pagos: z.array(pagoInput).min(1),
+    .min(1)
+    .max(200),
+  pagos: z.array(pagoInput).min(1).max(10),
   // Un vale por unidad. El qr es el contenido firmado que se imprimió.
   vales: z
     .array(z.object({ valeId: uuid, item: z.number().int().nonnegative(), qr: z.string().min(1).max(1000) }))
+    .max(1000)
     .default([]),
   // Supervisor que autorizó una cortesía o una transferencia.
   autorizadoPorId: idUsuario.optional(),
@@ -87,9 +92,10 @@ export const anulacionOp = z.object({
   autorizadoPorId: idUsuario.optional(),
   motivo: z.enum(MOTIVOS_ANULACION),
   detalle: z.string().trim().max(200).optional(),
-  valesRecuperados: z.array(uuid).default([]),
+  valesRecuperados: z.array(uuid).max(1000).default([]),
   devoluciones: z
     .array(z.object({ medio: z.enum(MEDIOS_PAGO), monto: monto, idExterno: z.string().trim().max(100).optional() }))
+    .max(10)
     .default([]),
 });
 
@@ -99,7 +105,7 @@ export const movimientoCajaOp = z.object({
   movimientoId: uuid,
   turnoId: uuid,
   movimiento: z.enum(TIPOS_MOVIMIENTO_CAJA),
-  monto: z.number().int().positive(),
+  monto: z.number().int().positive().max(MONTO_MAXIMO),
   motivo: z.string().trim().min(1).max(200),
   usuarioId: idUsuario,
   autorizadoPorId: idUsuario.optional(),
@@ -193,6 +199,9 @@ export const OBSERVACIONES: Record<string, string> = {
   otro_turno_abierto: "Había otro turno abierto en el posnet",
   turno_repetido: "La apertura del turno llegó dos veces",
   venta_repetida: "La venta llegó dos veces",
+  venta_anulada_antes_de_llegar: "La anulación llegó antes que la venta",
+  movimiento_repetido: "El retiro o ingreso llegó dos veces",
+  canje_repetido: "El canje llegó dos veces",
   venta_en_puesto_de_canje: "Venta hecha en un puesto de canje",
   cajero_distinto: "Vendió alguien distinto del cajero del turno",
   turno_cerrado: "Operación posterior al cierre del turno",
