@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { MODOS_VENTA, PLATAFORMAS, ROLES, type Evento, type Staff } from "@eventos/shared";
-import { api, pesos } from "./api";
+import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { MODOS_VENTA, PLATAFORMAS, ROLES, type Cuenta, type Evento, type Usuario } from "@eventos/shared";
+import { alVencerSesion, api, guardarToken, hayToken, pesos } from "./api";
+import { Acceso } from "./Acceso";
 
 type Opcion = { valor: string; texto: string };
 type Campo = {
   nombre: string;
   titulo: string;
-  tipo?: "texto" | "numero" | "pesos" | "select" | "fecha";
+  tipo?: "texto" | "numero" | "pesos" | "select" | "fecha" | "clave";
   opciones?: Opcion[];
   opcional?: boolean;
   textoVacio?: string;
@@ -38,12 +39,15 @@ function Recurso({
   campos,
   alCambiar,
   soloAlta = false,
+  acciones,
 }: {
   titulo: string;
   ruta: string;
   campos: Campo[];
   alCambiar?: () => void;
   soloAlta?: boolean;
+  /** Botones extra por fila (por ejemplo, vincular un posnet). */
+  acciones?: (fila: Record<string, any>, recargar: () => Promise<void>) => ReactNode;
 }) {
   const [filas, setFilas] = useState<Record<string, any>[]>([]);
   const [error, setError] = useState("");
@@ -74,9 +78,14 @@ function Recurso({
   };
 
   const borrar = async (id: number) => {
-    await api("DELETE", `${ruta}/${id}`);
-    await cargar();
-    alCambiar?.();
+    try {
+      await api("DELETE", `${ruta}/${id}`);
+      setError("");
+      await cargar();
+      alCambiar?.();
+    } catch (err) {
+      setError((err as Error).message);
+    }
   };
 
   return (
@@ -99,9 +108,12 @@ function Recurso({
                   <td key={c.nombre}>{c.mostrar ? c.mostrar(f) : String(f[c.nombre] ?? "—")}</td>
                 ))}
                 <td>
-                  <button className="secundario" onClick={() => borrar(f.id)}>
-                    Borrar
-                  </button>
+                  <div className="acciones">
+                    {acciones?.(f, cargar)}
+                    <button className="secundario" onClick={() => borrar(f.id)}>
+                      Borrar
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -124,7 +136,8 @@ function Recurso({
             ) : (
               <input
                 name={c.nombre}
-                type={c.tipo === "fecha" ? "datetime-local" : "text"}
+                type={c.tipo === "fecha" ? "datetime-local" : c.tipo === "clave" ? "password" : "text"}
+                autoComplete={c.tipo === "clave" ? "new-password" : undefined}
                 inputMode={c.tipo === "numero" || c.tipo === "pesos" ? "decimal" : undefined}
                 required={!c.opcional}
               />
@@ -227,6 +240,9 @@ function PantallaEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () =
       <Recurso
         titulo="Puntos de venta"
         ruta={`${base}/puntos-venta`}
+        acciones={(f, recargar) => (
+          <VincularPosnet ruta={`${base}/puntos-venta/${f.id}`} fila={f} alCambiar={recargar} />
+        )}
         campos={[
           { nombre: "nombre", titulo: "Nombre" },
           { nombre: "plataforma", titulo: "Posnet", tipo: "select", opciones: opciones(PLATAFORMAS) },
@@ -248,11 +264,74 @@ function PantallaEvento({ evento, alCambiar }: { evento: Evento; alCambiar: () =
   );
 }
 
+/** Genera la clave que se carga en la app del posnet. Se muestra una sola vez. */
+function VincularPosnet({
+  ruta,
+  fila,
+  alCambiar,
+}: {
+  ruta: string;
+  fila: Record<string, any>;
+  alCambiar: () => Promise<void>;
+}) {
+  const [clave, setClave] = useState<string | null>(null);
+  const [error, setError] = useState("");
+
+  const vincular = async () => {
+    if (fila.dispositivoVinculado && !confirm("El posnet que está vinculado va a dejar de funcionar. ¿Seguimos?"))
+      return;
+    try {
+      const { claveDispositivo } = await api<{ claveDispositivo: string }>("POST", `${ruta}/dispositivo`);
+      setClave(claveDispositivo);
+      setError("");
+      await alCambiar();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  return (
+    <>
+      <button className="secundario" onClick={vincular}>
+        {fila.dispositivoVinculado ? "Volver a vincular" : "Vincular posnet"}
+      </button>
+      {clave && (
+        <div className="aviso">
+          Cargá esta clave en la app del posnet. No se vuelve a mostrar: <code>{clave}</code>
+        </div>
+      )}
+      {error && <span className="error">{error}</span>}
+    </>
+  );
+}
+
+function PantallaUsuarios() {
+  return (
+    <Recurso
+      titulo="Usuarios de la cuenta"
+      ruta="/usuarios"
+      campos={[
+        { nombre: "nombre", titulo: "Nombre" },
+        { nombre: "usuario", titulo: "Usuario" },
+        { nombre: "rol", titulo: "Rol", tipo: "select", opciones: opciones(ROLES) },
+        {
+          nombre: "clave",
+          titulo: "Clave (para el panel)",
+          tipo: "clave",
+          opcional: true,
+          mostrar: (f) => (f.tieneClave ? "Sí" : "Solo tarjeta"),
+        },
+        { nombre: "nfcUid", titulo: "UID de la tarjeta NFC", opcional: true, mostrar: (f) => f.nfcUid ?? "—" },
+      ]}
+    />
+  );
+}
+
 function PantallaEventos({ alElegir }: { alElegir: (id: number) => void }) {
   const [eventos, setEventos] = useState<Evento[]>([]);
   const cargar = () => api<Evento[]>("GET", "/eventos").then(setEventos);
   useEffect(() => {
-    cargar();
+    cargar().catch(() => {});
   }, []);
 
   return (
@@ -285,47 +364,69 @@ function PantallaEventos({ alElegir }: { alElegir: (id: number) => void }) {
   );
 }
 
+type Yo = { usuario: Usuario; cuenta: Cuenta };
+
 export function App() {
-  const [pantalla, setPantalla] = useState<"eventos" | "staff">("eventos");
+  const [yo, setYo] = useState<Yo | null>(null);
+  const [cargando, setCargando] = useState(hayToken());
+  const [pantalla, setPantalla] = useState<"eventos" | "usuarios">("eventos");
   const [eventoId, setEventoId] = useState<number | null>(null);
   const [evento, setEvento] = useState<Evento | null>(null);
 
+  const cargarYo = useCallback(() => {
+    if (!hayToken()) return setCargando(false);
+    api<Yo>("GET", "/yo")
+      .then(setYo)
+      .catch(() => setYo(null))
+      .finally(() => setCargando(false));
+  }, []);
+
+  useEffect(() => {
+    alVencerSesion(() => setYo(null));
+    cargarYo();
+  }, [cargarYo]);
+
   const cargarEvento = useCallback(() => {
-    if (eventoId) api<Evento>("GET", `/eventos/${eventoId}`).then(setEvento);
+    if (eventoId) api<Evento>("GET", `/eventos/${eventoId}`).then(setEvento, () => setEvento(null));
     else setEvento(null);
   }, [eventoId]);
   useEffect(cargarEvento, [cargarEvento]);
 
+  const salir = async () => {
+    await api("POST", "/auth/salir").catch(() => {});
+    guardarToken(null);
+    setYo(null);
+    setEventoId(null);
+    setPantalla("eventos");
+  };
+
+  if (cargando) return null;
+  if (!yo) return <Acceso alEntrar={cargarYo} />;
+
   return (
     <>
       <header>
-        <strong>Eventos</strong>
+        <strong>{yo.cuenta.nombre}</strong>
         <button
           className={pantalla === "eventos" ? "activo" : ""}
           onClick={() => (setPantalla("eventos"), setEventoId(null))}
         >
           Eventos
         </button>
-        <button className={pantalla === "staff" ? "activo" : ""} onClick={() => setPantalla("staff")}>
-          Staff
-        </button>
+        {yo.usuario.rol === "admin" && (
+          <button className={pantalla === "usuarios" ? "activo" : ""} onClick={() => setPantalla("usuarios")}>
+            Usuarios
+          </button>
+        )}
+        <span className="espacio" />
+        <span className="quien">
+          {yo.usuario.nombre} ({yo.usuario.rol})
+        </span>
+        <button onClick={salir}>Salir</button>
       </header>
       <main>
-        {pantalla === "staff" ? (
-          <Recurso
-            titulo="Staff (login con tarjeta NFC)"
-            ruta="/staff"
-            campos={[
-              { nombre: "nombre", titulo: "Nombre" },
-              { nombre: "rol", titulo: "Rol", tipo: "select", opciones: opciones(ROLES) },
-              {
-                nombre: "nfcUid",
-                titulo: "UID de la tarjeta",
-                opcional: true,
-                mostrar: (f: Partial<Staff>) => f.nfcUid ?? "—",
-              },
-            ]}
-          />
+        {pantalla === "usuarios" ? (
+          <PantallaUsuarios />
         ) : evento ? (
           <PantallaEvento evento={evento} alCambiar={cargarEvento} />
         ) : (

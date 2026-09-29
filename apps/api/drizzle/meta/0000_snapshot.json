@@ -1,9 +1,40 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "ad1d79dd-e3bc-41dc-ac51-6e7984e7ced9",
+  "id": "a1e752d8-c136-49c8-b998-d40e2bde894a",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
+    "cuentas": {
+      "name": "cuentas",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "nombre": {
+          "name": "nombre",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "creada": {
+          "name": "creada",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
     "eventos": {
       "name": "eventos",
       "columns": {
@@ -13,6 +44,13 @@
           "primaryKey": true,
           "notNull": true,
           "autoincrement": true
+        },
+        "cuenta_id": {
+          "name": "cuenta_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
         },
         "nombre": {
           "name": "nombre",
@@ -52,7 +90,21 @@
         }
       },
       "indexes": {},
-      "foreignKeys": {},
+      "foreignKeys": {
+        "eventos_cuenta_id_cuentas_id_fk": {
+          "name": "eventos_cuenta_id_cuentas_id_fk",
+          "tableFrom": "eventos",
+          "tableTo": "cuentas",
+          "columnsFrom": [
+            "cuenta_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}
@@ -257,6 +309,13 @@
           "notNull": true,
           "autoincrement": false,
           "default": true
+        },
+        "clave_dispositivo_hash": {
+          "name": "clave_dispositivo_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {},
@@ -344,8 +403,8 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "staff": {
-      "name": "staff",
+    "sesiones": {
+      "name": "sesiones",
       "columns": {
         "id": {
           "name": "id",
@@ -354,11 +413,119 @@
           "notNull": true,
           "autoincrement": true
         },
+        "token_hash": {
+          "name": "token_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "usuario_id": {
+          "name": "usuario_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "origen": {
+          "name": "origen",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "punto_venta_id": {
+          "name": "punto_venta_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "expira": {
+          "name": "expira",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "sesiones_token_unico": {
+          "name": "sesiones_token_unico",
+          "columns": [
+            "token_hash"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "sesiones_usuario_id_usuarios_id_fk": {
+          "name": "sesiones_usuario_id_usuarios_id_fk",
+          "tableFrom": "sesiones",
+          "tableTo": "usuarios",
+          "columnsFrom": [
+            "usuario_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "sesiones_punto_venta_id_puntos_venta_id_fk": {
+          "name": "sesiones_punto_venta_id_puntos_venta_id_fk",
+          "tableFrom": "sesiones",
+          "tableTo": "puntos_venta",
+          "columnsFrom": [
+            "punto_venta_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "usuarios": {
+      "name": "usuarios",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "cuenta_id": {
+          "name": "cuenta_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
         "nombre": {
           "name": "nombre",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "usuario": {
+          "name": "usuario",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "clave_hash": {
+          "name": "clave_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "rol": {
@@ -385,15 +552,36 @@
         }
       },
       "indexes": {
-        "staff_nfc_uid_unico": {
-          "name": "staff_nfc_uid_unico",
+        "usuarios_usuario_unico": {
+          "name": "usuarios_usuario_unico",
+          "columns": [
+            "usuario"
+          ],
+          "isUnique": true
+        },
+        "usuarios_nfc_uid_unico": {
+          "name": "usuarios_nfc_uid_unico",
           "columns": [
             "nfc_uid"
           ],
           "isUnique": true
         }
       },
-      "foreignKeys": {},
+      "foreignKeys": {
+        "usuarios_cuenta_id_cuentas_id_fk": {
+          "name": "usuarios_cuenta_id_cuentas_id_fk",
+          "tableFrom": "usuarios",
+          "tableTo": "cuentas",
+          "columnsFrom": [
+            "cuenta_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}

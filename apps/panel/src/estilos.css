@@ -15,3 +15,10 @@ button { padding: 7px 12px; border-radius: 6px; border: 1px solid #1c1c1c; backg
 button.secundario { background: #fff; color: #1c1c1c; }
 .error { color: #b00020; margin: 8px 0; }
 .lista-eventos li { cursor: pointer; padding: 8px 0; }
+header .espacio { flex: 1; }
+header .quien { color: #ccc; font-size: 14px; }
+form.vertical { flex-direction: column; align-items: stretch; }
+.acceso { max-width: 420px; }
+button.enlace { background: none; border: none; color: #1c1c1c; text-decoration: underline; padding: 0; }
+td .acciones { display: flex; gap: 6px; }
+.aviso { background: #fff8e1; border: 1px solid #f0d58c; border-radius: 6px; padding: 10px; margin: 8px 0; word-break: break-all; }
