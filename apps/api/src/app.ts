@@ -1,7 +1,8 @@
+import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
-import { and, eq, gt, lte, ne } from "drizzle-orm";
+import { and, eq, gt, inArray, isNotNull, isNull, lte, ne, or, type SQL } from "drizzle-orm";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { z, ZodError, type ZodTypeAny } from "zod";
 import {
@@ -19,8 +20,30 @@ import {
   type Usuario,
 } from "@eventos/shared";
 import type { Db } from "./db/index.js";
-import { cuentas, eventos, impresoras, productos, puntosVenta, sectores, sesiones, usuarios } from "./db/schema.js";
-import { claveFicticia, generarToken, hashearClave, hashToken, verificarClave } from "./seguridad.js";
+import {
+  anulaciones,
+  canjes,
+  cuentas,
+  dispositivos,
+  eventos,
+  impresoras,
+  movimientosCaja,
+  movimientosStock,
+  operaciones,
+  productos,
+  puntosVenta,
+  sectores,
+  sesiones,
+  turnos,
+  usuarios,
+  vales,
+  ventaItems,
+  ventas,
+} from "./db/schema.js";
+import { ErrorApi, noEncontrado } from "./errores.js";
+import { rutasDispositivo } from "./rutas/dispositivo.js";
+import { rutasVentas } from "./rutas/ventas.js";
+import { claveFicticia, generarToken, hashearClave, hashNfc, hashToken, verificarClave } from "./seguridad.js";
 
 const idParam = z.coerce.number().int().positive();
 const DURACION_SESION_MS = 12 * 60 * 60 * 1000;
@@ -48,16 +71,7 @@ const LIMITE_NFC = {
 };
 const LIMITE_REGISTRO = { max: 10, timeWindow: "1 minute" };
 
-class ErrorApi extends Error {
-  constructor(
-    public status: number,
-    message: string,
-  ) {
-    super(message);
-  }
-}
-
-const noEncontrado = (que: string) => new ErrorApi(404, `${que} no encontrado`);
+const TIENE_OPERACIONES = "Tiene ventas u operaciones registradas: no se puede borrar. Desactivalo en su lugar.";
 
 type SesionActiva = {
   id: number;
@@ -80,13 +94,17 @@ declare module "fastify" {
 type FilaUsuario = typeof usuarios.$inferSelect;
 type FilaPuntoVenta = typeof puntosVenta.$inferSelect;
 
-/** Lo que se muestra de un usuario: nunca el hash de la clave. */
-const usuarioPublico = ({ claveHash, ...u }: FilaUsuario): Usuario => ({ ...u, tieneClave: claveHash !== null });
+/** Lo que se muestra de un usuario: nunca los hashes de la clave ni de la tarjeta. */
+const usuarioPublico = ({ claveHash, nfcHash, ...u }: FilaUsuario): Usuario => ({ ...u, tieneClave: claveHash !== null });
 
-const puntoVentaPublico = ({ claveDispositivoHash, ...pv }: FilaPuntoVenta) => ({
-  ...pv,
-  dispositivoVinculado: claveDispositivoHash !== null,
-});
+/** Lo que las rutas de cada módulo necesitan de la app: acceso a la base y los controles de permisos. */
+export type Contexto = {
+  db: Db;
+  exigirConfiguracion: (req: FastifyRequest) => void;
+  exigirSupervisor: (req: FastifyRequest) => void;
+  /** Lee :eventoId de la ruta y verifica que el evento sea de la cuenta de la sesión. */
+  eventoDeRuta: (req: FastifyRequest) => typeof eventos.$inferSelect;
+};
 
 export type OpcionesApp = {
   /** Permite crear cuentas nuevas. Si no hay ninguna cuenta, el registro siempre está abierto. */
@@ -106,8 +124,13 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       return reply.status(400).send({ error: "Datos inválidos", detalles: err.flatten().fieldErrors });
     }
     if (err instanceof ErrorApi) return reply.status(err.status).send({ error: err.message });
-    if (String((err as { code?: string }).code).startsWith("SQLITE_CONSTRAINT_UNIQUE")) {
+    const codigo = String((err as { code?: string }).code);
+    if (codigo.startsWith("SQLITE_CONSTRAINT_UNIQUE")) {
       return reply.status(409).send({ error: "Ya existe un registro con ese valor" });
+    }
+    // Con ON DELETE RESTRICT, SQLite informa SQLITE_CONSTRAINT_TRIGGER en vez de SQLITE_CONSTRAINT_FOREIGNKEY.
+    if (codigo.startsWith("SQLITE_CONSTRAINT") && (err as Error).message.includes("FOREIGN KEY")) {
+      return reply.status(409).send({ error: TIENE_OPERACIONES });
     }
     const status = (err as { statusCode?: number }).statusCode ?? 500;
     return reply.status(status).send({ error: status === 500 ? "Error interno" : (err as Error).message });
@@ -164,6 +187,13 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       }
     };
 
+    // Ver reportes y cargar stock es operar, no configurar: alcanza con el rol, aunque haya entrado con tarjeta.
+    const exigirSupervisor = (req: FastifyRequest) => {
+      if (!(ROLES_CONFIGURACION as readonly string[]).includes(req.sesion.rol)) {
+        throw new ErrorApi(403, "Solo un supervisor o administrador puede ver esto");
+      }
+    };
+
     const exigirAdmin = (req: FastifyRequest) => {
       exigirConfiguracion(req);
       if (req.sesion.rol !== "admin") throw new ErrorApi(403, "Solo un administrador puede hacer esto");
@@ -213,9 +243,10 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       }
       const pv = db
         .select({ id: puntosVenta.id, cuentaId: eventos.cuentaId })
-        .from(puntosVenta)
+        .from(dispositivos)
+        .innerJoin(puntosVenta, eq(puntosVenta.id, dispositivos.puntoVentaId))
         .innerJoin(eventos, eq(eventos.id, puntosVenta.eventoId))
-        .where(eq(puntosVenta.claveDispositivoHash, hashToken(claveDispositivo)))
+        .where(and(eq(dispositivos.claveHash, hashToken(claveDispositivo)), isNull(dispositivos.revocado)))
         .get();
       if (!pv) throw new ErrorApi(401, "Este dispositivo no está vinculado a ningún punto de venta");
       const fila = db
@@ -258,6 +289,54 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       return fila;
     };
 
+    // Un usuario que vendió, autorizó o canjeó algo queda en los reportes: no se borra, se desactiva.
+    // Solo cuenta lo registrado en eventos de su cuenta (un posnet de otra cuenta podría subir cualquier id).
+    const usuarioConActividad = (id: number, cuentaId: number) => {
+      const deLaCuenta = db.select({ id: eventos.id }).from(eventos).where(eq(eventos.cuentaId, cuentaId));
+      return [
+        db
+          .select({ x: operaciones.id })
+          .from(operaciones)
+          .where(and(eq(operaciones.usuarioId, id), inArray(operaciones.eventoId, deLaCuenta))),
+        db
+          .select({ x: ventas.id })
+          .from(ventas)
+          .where(and(or(eq(ventas.usuarioId, id), eq(ventas.autorizadoPorId, id)), inArray(ventas.eventoId, deLaCuenta))),
+        db
+          .select({ x: turnos.id })
+          .from(turnos)
+          .where(
+            and(
+              or(eq(turnos.usuarioId, id), eq(turnos.entregadoPorId, id), eq(turnos.cerradoPorId, id)),
+              inArray(turnos.eventoId, deLaCuenta),
+            ),
+          ),
+        db
+          .select({ x: anulaciones.id })
+          .from(anulaciones)
+          .where(
+            and(
+              or(eq(anulaciones.usuarioId, id), eq(anulaciones.autorizadoPorId, id)),
+              inArray(anulaciones.eventoId, deLaCuenta),
+            ),
+          ),
+        db
+          .select({ x: movimientosCaja.id })
+          .from(movimientosCaja)
+          .where(
+            and(
+              or(eq(movimientosCaja.usuarioId, id), eq(movimientosCaja.autorizadoPorId, id)),
+              inArray(movimientosCaja.eventoId, deLaCuenta),
+            ),
+          ),
+        db
+          .select({ x: canjes.id })
+          .from(canjes)
+          .where(and(eq(canjes.usuarioId, id), inArray(canjes.eventoId, deLaCuenta))),
+        db.select({ x: movimientosStock.id }).from(movimientosStock).where(eq(movimientosStock.usuarioId, id)),
+      ].some((q) => q.limit(1).get() !== undefined);
+    };
+
     app.get("/api/usuarios", async (req) => {
       exigirAdmin(req);
       return db.select().from(usuarios).where(eq(usuarios.cuentaId, req.sesion.cuentaId)).all().map(usuarioPublico);
@@ -267,9 +346,10 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       exigirAdmin(req);
       const { clave, ...datos } = usuarioInput.parse(req.body);
       const claveHash = clave === undefined ? null : await hashearClave(clave);
+      const nfcHash = datos.nfcUid ? await hashNfc(req.sesion.cuentaId, datos.nfcUid) : null;
       const creado = db
         .insert(usuarios)
-        .values({ ...datos, claveHash, cuentaId: req.sesion.cuentaId })
+        .values({ ...datos, claveHash, nfcHash, cuentaId: req.sesion.cuentaId })
         .returning()
         .get();
       return reply.status(201).send(usuarioPublico(creado));
@@ -285,14 +365,17 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       }
       const set: Partial<FilaUsuario> = { ...cambios };
       if (clave !== undefined) set.claveHash = await hashearClave(clave);
+      if (cambios.nfcUid !== undefined) {
+        set.nfcHash = cambios.nfcUid ? await hashNfc(req.sesion.cuentaId, cambios.nfcUid) : null;
+      }
       if (Object.keys(set).length === 0) return usuarioPublico(actual);
       const actualizado = db.update(usuarios).set(set).where(eq(usuarios.id, id)).returning().get();
-      // Si cambió algo del acceso, se cierran sus otras sesiones.
+      // Si cambió algo del acceso, se cierran sus otras sesiones (editar solo el nombre no lo saca).
       if (
         clave !== undefined ||
-        cambios.rol !== undefined ||
-        cambios.activo !== undefined ||
-        cambios.nfcUid !== undefined
+        (cambios.rol !== undefined && cambios.rol !== actual.rol) ||
+        (cambios.activo !== undefined && cambios.activo !== actual.activo) ||
+        (cambios.nfcUid !== undefined && cambios.nfcUid !== actual.nfcUid)
       ) {
         db.delete(sesiones)
           .where(and(eq(sesiones.usuarioId, id), ne(sesiones.id, req.sesion.id)))
@@ -306,6 +389,7 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       const id = idParam.parse((req.params as { id: string }).id);
       if (id === req.sesion.usuarioId) throw new ErrorApi(400, "No podés borrar tu propio usuario");
       buscarUsuario(id, req.sesion.cuentaId);
+      if (usuarioConActividad(id, req.sesion.cuentaId)) throw new ErrorApi(409, TIENE_OPERACIONES);
       db.delete(usuarios).where(eq(usuarios.id, id)).run();
       return reply.status(204).send();
     });
@@ -321,8 +405,14 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       return evento;
     };
 
-    const validarFechas = (e: { inicio: string; fin: string }) => {
+    const validarEvento = (e: { inicio: string; fin: string; valesValidez: string; valesVencimiento: string | null }) => {
       if (new Date(e.fin) <= new Date(e.inicio)) throw new ErrorApi(400, "El fin tiene que ser posterior al inicio");
+      if (e.valesValidez === "fecha") {
+        if (!e.valesVencimiento) throw new ErrorApi(400, "Indicá hasta cuándo sirven los vales");
+        if (new Date(e.valesVencimiento) <= new Date(e.inicio)) {
+          throw new ErrorApi(400, "El vencimiento de los vales tiene que ser posterior al inicio del evento");
+        }
+      }
     };
 
     app.get("/api/eventos", async (req) =>
@@ -336,7 +426,7 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
     app.post("/api/eventos", async (req, reply) => {
       exigirConfiguracion(req);
       const datos = eventoInput.parse(req.body);
-      validarFechas(datos);
+      validarEvento(datos);
       const creado = db
         .insert(eventos)
         .values({ ...datos, cuentaId: req.sesion.cuentaId })
@@ -350,7 +440,7 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       const id = idParam.parse((req.params as { id: string }).id);
       const actual = buscarEvento(id, req.sesion.cuentaId);
       const cambios = eventoInput.partial().parse(req.body);
-      validarFechas({ ...actual, ...cambios });
+      validarEvento({ ...actual, ...cambios });
       if (Object.keys(cambios).length === 0) return actual;
       return db.update(eventos).set(cambios).where(eq(eventos.id, id)).returning().get();
     });
@@ -359,9 +449,22 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       exigirConfiguracion(req);
       const id = idParam.parse((req.params as { id: string }).id);
       buscarEvento(id, req.sesion.cuentaId);
+      if (posnetUsado(eq(puntosVenta.eventoId, id))) throw new ErrorApi(409, POSNET_USADO);
       db.delete(eventos).where(eq(eventos.id, id)).run();
       return reply.status(204).send();
     });
+
+    // Un posnet que ya se conectó puede tener ventas guardadas sin subir: si se borrara, no las podría subir nunca.
+    const POSNET_USADO =
+      "Tiene un posnet que ya se usó y puede tener ventas sin subir: no se puede borrar.";
+    const posnetUsado = (filtro: SQL | undefined) =>
+      db
+        .select({ id: dispositivos.id })
+        .from(dispositivos)
+        .innerJoin(puntosVenta, eq(puntosVenta.id, dispositivos.puntoVentaId))
+        .where(and(filtro, isNotNull(dispositivos.ultimoContacto)))
+        .limit(1)
+        .get() !== undefined;
 
     // ---- Recursos que pertenecen a un evento ----
     // Cada referencia (sectorId, impresoraId) tiene que apuntar a algo del mismo evento.
@@ -383,7 +486,13 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       {
         referencias = {},
         serializar = (f: any) => f,
-      }: { referencias?: Referencias; serializar?: (fila: any) => unknown } = {},
+        antesDeBorrar,
+      }: {
+        referencias?: Referencias;
+        serializar?: (fila: any) => unknown;
+        /** Para frenar el borrado de algo que ya se usó en ventas. */
+        antesDeBorrar?: (id: number, eventoId: number) => void;
+      } = {},
     ) => {
       const base = `/api/eventos/:eventoId/${ruta}`;
       const validarReferencias = (eventoId: number, datos: Record<string, unknown>) => {
@@ -439,6 +548,8 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
       app.delete(`${base}/:id`, async (req, reply) => {
         exigirConfiguracion(req);
         const { eventoId, id } = params(req);
+        if (!db.select({ id: tabla.id }).from(tabla).where(filtro(eventoId, id!)).get()) throw noEncontrado(nombre);
+        antesDeBorrar?.(id!, eventoId);
         const borrado = db.delete(tabla).where(filtro(eventoId, id!)).returning().get();
         if (!borrado) throw noEncontrado(nombre);
         return reply.status(204).send();
@@ -451,39 +562,99 @@ export function crearApp(db: Db, opciones: OpcionesApp = {}) {
     });
     recursoDeEvento("productos", "Producto", productos, productoInput, {
       referencias: { sectorId: { tabla: sectores, nombre: "El sector" } },
+      antesDeBorrar: (id, eventoId) => {
+        // Vendido o canjeado en este evento. (Un vale de este producto canjeado en otro evento existe como vale acá.)
+        const usado =
+          db
+            .select({ x: ventaItems.id })
+            .from(ventaItems)
+            .innerJoin(ventas, eq(ventas.id, ventaItems.ventaId))
+            .where(and(eq(ventaItems.productoId, id), eq(ventas.eventoId, eventoId)))
+            .limit(1)
+            .get() ??
+          db
+            .select({ x: vales.id })
+            .from(vales)
+            .where(and(eq(vales.productoId, id), eq(vales.eventoId, eventoId)))
+            .limit(1)
+            .get() ??
+          db
+            .select({ x: canjes.id })
+            .from(canjes)
+            .where(and(eq(canjes.productoId, id), eq(canjes.eventoId, eventoId)))
+            .limit(1)
+            .get();
+        if (usado) throw new ErrorApi(409, TIENE_OPERACIONES);
+      },
     });
-    recursoDeEvento("puntos-venta", "Punto de venta", puntosVenta, puntoVentaInput, { serializar: puntoVentaPublico });
+
+    const dispositivoActivo = (puntoVentaId: number) =>
+      db
+        .select({ id: dispositivos.id, ultimoContacto: dispositivos.ultimoContacto })
+        .from(dispositivos)
+        .where(and(eq(dispositivos.puntoVentaId, puntoVentaId), isNull(dispositivos.revocado)))
+        .get();
+    const puntoVentaPublico = (pv: FilaPuntoVenta) => {
+      const disp = dispositivoActivo(pv.id);
+      return { ...pv, dispositivoVinculado: disp !== undefined, ultimoContacto: disp?.ultimoContacto ?? null };
+    };
+    recursoDeEvento("puntos-venta", "Punto de venta", puntosVenta, puntoVentaInput, {
+      referencias: { sectorId: { tabla: sectores, nombre: "El sector" } },
+      serializar: puntoVentaPublico,
+      antesDeBorrar: (id) => {
+        if (posnetUsado(eq(dispositivos.puntoVentaId, id))) throw new ErrorApi(409, POSNET_USADO);
+      },
+    });
 
     // Vincula un posnet al punto de venta. La clave se muestra una sola vez y se carga en la app del posnet.
+    // Si ya había uno vinculado, queda revocado: no entra ni baja configuración, pero puede terminar de subir lo que vendió.
+    const revocar = (puntoVentaId: number) => {
+      db.update(dispositivos)
+        .set({ revocado: ahora() })
+        .where(and(eq(dispositivos.puntoVentaId, puntoVentaId), isNull(dispositivos.revocado)))
+        .run();
+      db.delete(sesiones).where(eq(sesiones.puntoVentaId, puntoVentaId)).run();
+    };
+
+    const puntoDeVentaDeRuta = (req: FastifyRequest) => {
+      const { eventoId, id } = params(req);
+      const pv = db
+        .select({ id: puntosVenta.id })
+        .from(puntosVenta)
+        .where(and(eq(puntosVenta.id, id!), eq(puntosVenta.eventoId, eventoId)))
+        .get();
+      if (!pv) throw noEncontrado("Punto de venta");
+      return pv.id;
+    };
+
     app.post("/api/eventos/:eventoId/puntos-venta/:id/dispositivo", async (req) => {
       exigirAdmin(req);
-      const { eventoId, id } = params(req);
+      const puntoVentaId = puntoDeVentaDeRuta(req);
       const claveDispositivo = generarToken();
-      const actualizado = db
-        .update(puntosVenta)
-        .set({ claveDispositivoHash: hashToken(claveDispositivo) })
-        .where(and(eq(puntosVenta.id, id!), eq(puntosVenta.eventoId, eventoId)))
-        .returning()
-        .get();
-      if (!actualizado) throw noEncontrado("Punto de venta");
-      // El dispositivo anterior deja de valer, y con él las sesiones abiertas desde ese punto de venta.
-      db.delete(sesiones).where(eq(sesiones.puntoVentaId, id!)).run();
-      return { claveDispositivo };
+      const dispositivoId = randomUUID();
+      db.transaction(() => {
+        revocar(puntoVentaId);
+        db.insert(dispositivos)
+          .values({ id: dispositivoId, puntoVentaId, claveHash: hashToken(claveDispositivo), creado: ahora() })
+          .run();
+      });
+      return { claveDispositivo, dispositivoId };
     });
 
     app.delete("/api/eventos/:eventoId/puntos-venta/:id/dispositivo", async (req, reply) => {
       exigirAdmin(req);
-      const { eventoId, id } = params(req);
-      const actualizado = db
-        .update(puntosVenta)
-        .set({ claveDispositivoHash: null })
-        .where(and(eq(puntosVenta.id, id!), eq(puntosVenta.eventoId, eventoId)))
-        .returning()
-        .get();
-      if (!actualizado) throw noEncontrado("Punto de venta");
-      db.delete(sesiones).where(eq(sesiones.puntoVentaId, id!)).run();
+      revocar(puntoDeVentaDeRuta(req));
       return reply.status(204).send();
     });
+
+    const contexto: Contexto = {
+      db,
+      exigirConfiguracion,
+      exigirSupervisor,
+      eventoDeRuta: (req) => buscarEvento(params(req).eventoId, req.sesion.cuentaId),
+    };
+    rutasVentas(app, contexto);
+    rutasDispositivo(app, db);
   });
 
   return app;
