@@ -140,14 +140,20 @@ export const sincronizacionInput = z.object({
   operaciones: z.array(z.unknown()).max(500),
 });
 
-export const movimientoStockInput = z.object({
-  productoId: z.number().int().positive(),
-  tipo: z.enum(TIPOS_MOVIMIENTO_STOCK),
-  // Positivo suma, negativo resta. Una carga siempre es positiva.
-  cantidad: z.number().int().refine((n) => n !== 0, "La cantidad no puede ser cero"),
-  sectorId: z.number().int().positive().nullable().default(null),
-  nota: z.string().trim().max(200).optional(),
-});
+export const movimientoStockInput = z
+  .object({
+    productoId: z.number().int().positive(),
+    // carga: entra mercadería. merma: se rompió o se perdió. ajuste: corrige el stock tras un conteo.
+    tipo: z.enum(TIPOS_MOVIMIENTO_STOCK),
+    // Carga y merma van en positivo (la merma resta). El ajuste puede ser positivo o negativo.
+    cantidad: z.number().int().min(-100000).max(100000),
+    sectorId: z.number().int().positive().nullable().default(null),
+    nota: z.string().trim().max(200).optional(),
+  })
+  .refine((m) => (m.tipo === "ajuste" ? m.cantidad !== 0 : m.cantidad > 0), {
+    message: "La cantidad tiene que ser mayor que cero (en un ajuste, distinta de cero)",
+    path: ["cantidad"],
+  });
 
 export type MedioPago = (typeof MEDIOS_PAGO)[number];
 export type Operacion = z.infer<typeof operacionInput>;

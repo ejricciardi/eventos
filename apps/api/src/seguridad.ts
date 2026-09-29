@@ -42,3 +42,24 @@ export const generarToken = () => randomBytes(32).toString("base64url");
 
 // Los tokens ya son aleatorios de 256 bits, así que alcanza con SHA-256 (sin sal) para guardarlos.
 export const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
+
+/**
+ * Parámetros con los que el posnet calcula el hash de una tarjeta para validarla sin conexión.
+ * El UID de una tarjeta es corto (4 a 7 bytes), así que se usa scrypt: si alguien saca la lista de un posnet,
+ * probar todos los UID posibles deja de ser cuestión de segundos. La sal es por cuenta.
+ */
+export const parametrosNfc = (cuentaId: number) => ({
+  algoritmo: "scrypt" as const,
+  N,
+  r: R,
+  p: P,
+  largo: LARGO,
+  sal: `eventos-nfc:${cuentaId}`,
+});
+
+/** Hash de un UID de tarjeta (en mayúsculas), en hexadecimal. */
+export async function hashNfc(cuentaId: number, nfcUid: string): Promise<string> {
+  const { sal } = parametrosNfc(cuentaId);
+  const hash = await scryptAsync(nfcUid.toUpperCase(), Buffer.from(sal, "utf8"), LARGO, { N, r: R, p: P });
+  return hash.toString("hex");
+}

@@ -4,6 +4,14 @@ import { z } from "zod";
 const centavos = z.number().int().nonnegative();
 const texto = z.string().trim().min(1).max(120);
 
+/**
+ * Hasta cuándo sirve un vale:
+ * - fin_evento: hasta que termina el evento.
+ * - fecha: hasta la fecha y hora de valesVencimiento.
+ * - sin_vencimiento: no vence y se puede canjear en otros eventos de la cuenta que vendan el mismo producto.
+ */
+export const VALIDEZ_VALES = ["fin_evento", "fecha", "sin_vencimiento"] as const;
+
 /** Cómo se vende en el evento: con vales canjeables o con comanda directa al sector. */
 export const MODOS_VENTA = ["vales", "directo"] as const;
 export const PLATAFORMAS = ["clover", "mercadopago", "otro"] as const;
@@ -17,9 +25,10 @@ export const eventoInput = z.object({
   inicio: z.string().datetime({ offset: true }),
   fin: z.string().datetime({ offset: true }),
   modoVenta: z.enum(MODOS_VENTA).default("vales"),
-  // Vencimiento de los vales: si vencen, lo hacen en valesVencimiento o, si no se fija, al terminar el evento.
-  // Se evalúa al canjear con la configuración vigente, así un cambio vale también para los vales ya impresos.
-  valesVencen: z.boolean().default(true),
+  // Hasta cuándo sirven los vales. Se evalúa al canjear con la configuración vigente,
+  // así un cambio vale también para los vales ya impresos.
+  valesValidez: z.enum(VALIDEZ_VALES).default("fin_evento"),
+  // Solo para validez "fecha".
   valesVencimiento: z.string().datetime({ offset: true }).nullable().default(null),
   // Minutos en los que el cajero puede anular solo; después hace falta un supervisor.
   minutosAnulacionCajero: z.number().int().min(0).max(240).default(5),
@@ -41,6 +50,9 @@ export const sectorInput = z.object({
 
 export const productoInput = z.object({
   nombre: texto,
+  // Código del producto en tu catálogo. Sirve para reconocer el mismo producto en otro evento
+  // (por ejemplo, al canjear un vale sin vencimiento). Si no hay código, se compara por nombre.
+  codigo: z.string().trim().max(40).nullable().default(null),
   categoria: z.string().trim().max(60).optional(),
   precio: centavos,
   sectorId: z.number().int().positive().nullable().default(null),
@@ -129,9 +141,16 @@ export function imprimeVales(evento: Pick<Evento, "modoVenta">, pv: Pick<PuntoVe
 }
 
 /** Fecha y hora desde la que un vale del evento está vencido, o null si no vence. */
-export function vencimientoVales(evento: Pick<Evento, "valesVencen" | "valesVencimiento" | "fin">): string | null {
-  if (!evento.valesVencen) return null;
-  return evento.valesVencimiento ?? evento.fin;
+export function vencimientoVales(evento: Pick<Evento, "valesValidez" | "valesVencimiento" | "fin">): string | null {
+  if (evento.valesValidez === "sin_vencimiento") return null;
+  if (evento.valesValidez === "fecha" && evento.valesVencimiento) return evento.valesVencimiento;
+  return evento.fin;
 }
 
-export * from "./operaciones.js";
+/** Clave para reconocer el mismo producto en dos eventos: el código, o el nombre normalizado si no hay código. */
+export function claveProducto(p: { codigo?: string | null; nombre: string }): string {
+  if (p.codigo) return `codigo:${p.codigo.trim().toUpperCase()}`;
+  return `nombre:${p.nombre.normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase().replace(/\s+/g, " ")}`;
+}
+
+export * from "./operaciones";
