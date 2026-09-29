@@ -1,0 +1,12 @@
+{
+  "name": "eventos",
+  "private": true,
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {
+    "dev:api": "npm run dev -w @eventos/api",
+    "dev:panel": "npm run dev -w @eventos/panel",
+    "test": "npm test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present"
+  }
+}
